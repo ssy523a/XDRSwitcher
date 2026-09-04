@@ -18,6 +18,10 @@ struct MenuBarContentView: View {
         Text("Current Application: \(appState.currentApplicationName)")
         Text("Current Reference Mode: \(appState.currentReferenceModeName)")
 
+        if let automaticSwitchingErrorMessage = appState.automaticSwitchingErrorMessage {
+            Text("Recent Error: \(automaticSwitchingErrorMessage)")
+        }
+
         Divider()
 
         Button("Open Settings") {
@@ -33,6 +37,7 @@ struct MenuBarContentView: View {
 
     private func openSettingsWindow() {
         openSettings()
+        NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
     private var automaticSwitchingBinding: Binding<Bool> {

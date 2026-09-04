@@ -1,4 +1,6 @@
+import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @Binding var appState: AppState
@@ -7,6 +9,12 @@ struct SettingsView: View {
         Form {
             Section("General") {
                 Toggle("Automatic Switching", isOn: automaticSwitchingBinding)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    LabeledContent("Current Application", value: appState.currentApplicationName)
+                    LabeledContent("Bundle Identifier", value: appState.currentApplicationBundleIdentifier)
+                }
+
                 LabeledContent("Current Reference Mode", value: appState.currentReferenceModeName)
 
                 VStack(alignment: .leading, spacing: 8) {
@@ -28,10 +36,22 @@ struct SettingsView: View {
                     }
                     .disabled(appState.availableReferencePresets.isEmpty)
 
-                    Button("Make Current Mode Default") {
-                        appState.useCurrentReferenceModeAsDefault()
+                    HStack {
+                        Button("Make Current Mode Default") {
+                            appState.useCurrentReferenceModeAsDefault()
+                        }
+                        .disabled(appState.currentReferencePresetID == nil)
+
+                        Button("Apply Default Mode") {
+                            appState.applyDefaultReferenceMode()
+                        }
+                        .disabled(
+                            appState.settings.defaultPresetUniqueID == nil ||
+                            appState.missingDefaultPresetID != nil ||
+                            appState.isApplyingReferenceMode ||
+                            appState.isRefreshingReferenceModes
+                        )
                     }
-                    .disabled(appState.currentReferencePresetID == nil)
                 }
 
                 Button("Refresh") {
@@ -59,6 +79,14 @@ struct SettingsView: View {
             if let settingsErrorMessage = appState.settingsErrorMessage {
                 Section("Settings") {
                     Text(settingsErrorMessage)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                }
+            }
+
+            if let automaticSwitchingErrorMessage = appState.automaticSwitchingErrorMessage {
+                Section("Automatic Switching") {
+                    Text(automaticSwitchingErrorMessage)
                         .foregroundStyle(.red)
                         .textSelection(.enabled)
                 }
@@ -116,8 +144,27 @@ struct SettingsView: View {
             }
 
             Section("Application Rules") {
-                Button("Add Application") {}
-                    .disabled(true)
+                if appState.settings.appRules.isEmpty {
+                    Text("No application rules have been added.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(appState.settings.appRules) { rule in
+                        AppRuleRow(
+                            rule: rule,
+                            presets: appState.availableReferencePresets,
+                            isPresetMissing: appState.isApplicationRulePresetMissing(rule),
+                            presetSelection: applicationRulePresetBinding(for: rule.id),
+                            isEnabled: applicationRuleEnabledBinding(for: rule.id),
+                            deleteAction: {
+                                appState.deleteApplicationRule(ruleID: rule.id)
+                            }
+                        )
+                    }
+                }
+
+                Button("Add Application") {
+                    appState.addApplicationRuleFromPanel()
+                }
             }
         }
         .formStyle(.grouped)
@@ -143,5 +190,102 @@ struct SettingsView: View {
                 appState.setDefaultReferencePreset(uniqueID: newValue)
             }
         )
+    }
+
+    private func applicationRulePresetBinding(for ruleID: UUID) -> Binding<String> {
+        Binding(
+            get: {
+                appState.settings.appRules.first(where: { $0.id == ruleID })?.presetUniqueID ?? ""
+            },
+            set: { newValue in
+                appState.setApplicationRulePreset(ruleID: ruleID, presetUniqueID: newValue)
+            }
+        )
+    }
+
+    private func applicationRuleEnabledBinding(for ruleID: UUID) -> Binding<Bool> {
+        Binding(
+            get: {
+                appState.settings.appRules.first(where: { $0.id == ruleID })?.enabled ?? false
+            },
+            set: { newValue in
+                appState.setApplicationRuleEnabled(ruleID: ruleID, isEnabled: newValue)
+            }
+        )
+    }
+}
+
+private struct AppRuleRow: View {
+    let rule: AppRule
+    let presets: [ReferencePreset]
+    let isPresetMissing: Bool
+    let presetSelection: Binding<String>
+    let isEnabled: Binding<Bool>
+    let deleteAction: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                appIcon
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(rule.appDisplayName)
+                        .font(.headline)
+                    Text(rule.bundleIdentifier)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+
+                Spacer()
+
+                Toggle("Enabled", isOn: isEnabled)
+                    .labelsHidden()
+
+                Button(role: .destructive, action: deleteAction) {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .help("Delete Rule")
+            }
+
+            Picker("Reference Mode", selection: presetSelection) {
+                if isPresetMissing {
+                    Text("\(rule.presetName) (Missing)")
+                        .tag(rule.presetUniqueID)
+                }
+
+                ForEach(presets) { preset in
+                    Text(preset.displayName)
+                        .tag(preset.uniqueID)
+                }
+            }
+            .disabled(presets.isEmpty)
+
+            if isPresetMissing {
+                Text("The saved Reference Mode is not available on the current display.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var appIcon: some View {
+        Image(nsImage: resolvedIcon)
+            .resizable()
+            .frame(width: 32, height: 32)
+    }
+
+    private var resolvedIcon: NSImage {
+        if let appPath = rule.appPath, FileManager.default.fileExists(atPath: appPath) {
+            return NSWorkspace.shared.icon(forFile: appPath)
+        }
+
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: rule.bundleIdentifier) {
+            return NSWorkspace.shared.icon(forFile: appURL.path)
+        }
+
+        return NSWorkspace.shared.icon(for: .application)
     }
 }
