@@ -8,30 +8,31 @@ struct SettingsView: View {
             Section("General") {
                 Toggle("Automatic Switching", isOn: automaticSwitchingBinding)
                 LabeledContent("Current Reference Mode", value: appState.currentReferenceModeName)
-                LabeledContent("Default Reference Mode", value: appState.defaultReferenceModeName)
 
-                Picker("Default Reference Mode", selection: defaultReferenceModeBinding) {
-                    if appState.settings.defaultPresetUniqueID == nil {
-                        Text("Not Available")
-                            .tag(Optional<String>.none)
-                    }
+                VStack(alignment: .leading, spacing: 8) {
+                    Picker("Default Reference Mode", selection: defaultReferenceModeBinding) {
+                        if appState.settings.defaultPresetUniqueID == nil {
+                            Text("Not Available")
+                                .tag(Optional<String>.none)
+                        }
 
-                    if let missingDefaultPresetID = appState.missingDefaultPresetID {
-                        Text("\(appState.defaultReferenceModeName) (Unavailable)")
-                            .tag(Optional(missingDefaultPresetID))
-                    }
+                        if let missingDefaultPresetID = appState.missingDefaultPresetID {
+                            Text("\(appState.defaultReferenceModeName) (Unavailable)")
+                                .tag(Optional(missingDefaultPresetID))
+                        }
 
-                    ForEach(appState.availableReferencePresets) { preset in
-                        Text(preset.displayName)
-                            .tag(Optional(preset.uniqueID))
+                        ForEach(appState.availableReferencePresets) { preset in
+                            Text(preset.displayName)
+                                .tag(Optional(preset.uniqueID))
+                        }
                     }
+                    .disabled(appState.availableReferencePresets.isEmpty)
+
+                    Button("Make Current Mode Default") {
+                        appState.useCurrentReferenceModeAsDefault()
+                    }
+                    .disabled(appState.currentReferencePresetID == nil)
                 }
-                .disabled(appState.availableReferencePresets.isEmpty)
-
-                Button("Use Current Reference Mode") {
-                    appState.useCurrentReferenceModeAsDefault()
-                }
-                .disabled(appState.currentReferencePresetID == nil)
 
                 Button("Refresh") {
                     appState.refreshReferenceModes()
@@ -121,7 +122,7 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .padding()
-        .frame(width: 520, height: 460)
+        .frame(width: 520, height: 690)
     }
 
     private var automaticSwitchingBinding: Binding<Bool> {

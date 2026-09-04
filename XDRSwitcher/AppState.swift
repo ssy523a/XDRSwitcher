@@ -23,6 +23,7 @@ struct AppState {
         do {
             if let savedSettings = try settingsStore.loadSettings() {
                 settings = savedSettings
+                loadInitialReferenceModes(using: displayPresetService)
             } else {
                 settings = XDRSwitcherSettings.defaults
                 try initializeDefaultReferenceMode(using: displayPresetService)
@@ -144,6 +145,16 @@ struct AppState {
         if let activePreset = snapshot.activePreset {
             settings.defaultPresetUniqueID = activePreset.uniqueID
             settings.defaultPresetName = activePreset.displayName
+        }
+    }
+
+    private mutating func loadInitialReferenceModes(using service: any DisplayPresetServicing) {
+        do {
+            let snapshot = try service.loadBuiltInDisplayPresets()
+            updateReferenceModeState(with: snapshot)
+        } catch {
+            referenceModeErrorMessage = error.localizedDescription
+            print("XDRSwitcher CoreDisplay initial refresh error: \(error.localizedDescription)")
         }
     }
 
