@@ -9,6 +9,17 @@ struct SettingsView: View {
         Form {
             Section("General") {
                 Toggle("Automatic Switching", isOn: automaticSwitchingBinding)
+                Toggle("Launch at Login", isOn: launchAtLoginBinding)
+
+                if let approvalMessage = appState.launchAtLoginStatus.approvalMessage {
+                    Text(approvalMessage)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+
+                    Button("Open Login Items Settings") {
+                        appState.openLaunchAtLoginSystemSettings()
+                    }
+                }
 
                 VStack(alignment: .leading, spacing: 6) {
                     LabeledContent("Current Application", value: appState.currentApplicationName)
@@ -84,11 +95,43 @@ struct SettingsView: View {
                 }
             }
 
+            if let launchAtLoginErrorMessage = appState.launchAtLoginErrorMessage {
+                Section("Launch at Login") {
+                    Text(launchAtLoginErrorMessage)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                }
+            }
+
             if let automaticSwitchingErrorMessage = appState.automaticSwitchingErrorMessage {
                 Section("Automatic Switching") {
                     Text(automaticSwitchingErrorMessage)
                         .foregroundStyle(.red)
                         .textSelection(.enabled)
+                }
+            }
+
+            Section("Application Rules") {
+                if appState.settings.appRules.isEmpty {
+                    Text("No application rules have been added.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(appState.settings.appRules) { rule in
+                        AppRuleRow(
+                            rule: rule,
+                            presets: appState.availableReferencePresets,
+                            isPresetMissing: appState.isApplicationRulePresetMissing(rule),
+                            presetSelection: applicationRulePresetBinding(for: rule.id),
+                            isEnabled: applicationRuleEnabledBinding(for: rule.id),
+                            deleteAction: {
+                                appState.deleteApplicationRule(ruleID: rule.id)
+                            }
+                        )
+                    }
+                }
+
+                Button("Add Application") {
+                    appState.addApplicationRuleFromPanel()
                 }
             }
 
@@ -142,30 +185,6 @@ struct SettingsView: View {
                     }
                 }
             }
-
-            Section("Application Rules") {
-                if appState.settings.appRules.isEmpty {
-                    Text("No application rules have been added.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(appState.settings.appRules) { rule in
-                        AppRuleRow(
-                            rule: rule,
-                            presets: appState.availableReferencePresets,
-                            isPresetMissing: appState.isApplicationRulePresetMissing(rule),
-                            presetSelection: applicationRulePresetBinding(for: rule.id),
-                            isEnabled: applicationRuleEnabledBinding(for: rule.id),
-                            deleteAction: {
-                                appState.deleteApplicationRule(ruleID: rule.id)
-                            }
-                        )
-                    }
-                }
-
-                Button("Add Application") {
-                    appState.addApplicationRuleFromPanel()
-                }
-            }
         }
         .formStyle(.grouped)
         .padding()
@@ -176,6 +195,13 @@ struct SettingsView: View {
         Binding(
             get: { appState.isAutomaticSwitchingEnabled },
             set: { appState.setAutomaticSwitchingEnabled($0) }
+        )
+    }
+
+    private var launchAtLoginBinding: Binding<Bool> {
+        Binding(
+            get: { appState.isLaunchAtLoginEnabled },
+            set: { appState.setLaunchAtLoginEnabled($0) }
         )
     }
 

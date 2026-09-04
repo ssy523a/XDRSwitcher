@@ -12,18 +12,23 @@ struct AppState {
     var referenceModeErrorMessage: String?
     var settingsErrorMessage: String?
     var automaticSwitchingErrorMessage: String?
+    var launchAtLoginStatus = LaunchAtLoginStatus.notRegistered
+    var launchAtLoginErrorMessage: String?
     var targetReferenceModeName = "Not Available"
     var isPendingReferenceModeSwitch = false
     var isRefreshingReferenceModes = false
     var isApplyingReferenceMode = false
 
     private var settingsStore: SettingsStore
+    private var launchAtLoginService: any LaunchAtLoginServicing
 
     init(
         settingsStore: SettingsStore = SettingsStore(),
-        displayPresetService: any DisplayPresetServicing = DisplayPresetService()
+        displayPresetService: any DisplayPresetServicing = DisplayPresetService(),
+        launchAtLoginService: any LaunchAtLoginServicing = LaunchAtLoginService()
     ) {
         self.settingsStore = settingsStore
+        self.launchAtLoginService = launchAtLoginService
 
         do {
             if let savedSettings = try settingsStore.loadSettings() {
@@ -39,6 +44,8 @@ struct AppState {
             settingsErrorMessage = error.localizedDescription
             print("XDRSwitcher settings error: \(error.localizedDescription)")
         }
+
+        refreshLaunchAtLoginStatus()
     }
 
     var isAutomaticSwitchingEnabled: Bool {
@@ -47,6 +54,10 @@ struct AppState {
 
     var defaultReferenceModeName: String {
         settings.defaultPresetName ?? "Not Available"
+    }
+
+    var isLaunchAtLoginEnabled: Bool {
+        launchAtLoginStatus.isToggleOn
     }
 
     var defaultPresetAvailabilityMessage: String? {
@@ -76,6 +87,28 @@ struct AppState {
     mutating func setAutomaticSwitchingEnabled(_ isEnabled: Bool) {
         settings.automaticSwitchingEnabled = isEnabled
         saveSettings()
+    }
+
+    mutating func refreshLaunchAtLoginStatus() {
+        launchAtLoginStatus = launchAtLoginService.currentStatus()
+    }
+
+    mutating func setLaunchAtLoginEnabled(_ isEnabled: Bool) {
+        launchAtLoginErrorMessage = nil
+
+        do {
+            launchAtLoginStatus = try launchAtLoginService.setEnabled(isEnabled)
+            settings.launchAtLoginEnabled = launchAtLoginStatus.isToggleOn
+            saveSettings()
+        } catch {
+            launchAtLoginErrorMessage = error.localizedDescription
+            refreshLaunchAtLoginStatus()
+            print("XDRSwitcher Launch at Login error: \(error.localizedDescription)")
+        }
+    }
+
+    func openLaunchAtLoginSystemSettings() {
+        launchAtLoginService.openSystemSettingsLoginItems()
     }
 
     mutating func updateActiveApplication(_ applicationInfo: ActiveApplicationInfo) {

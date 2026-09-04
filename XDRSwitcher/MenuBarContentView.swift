@@ -6,8 +6,11 @@ struct MenuBarContentView: View {
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        Text("XDR Switcher")
-            .font(.headline)
+        Button {
+            showAboutDialog()
+        } label: {
+            Label("About XDR Switcher", systemImage: "info.circle")
+        }
 
         Divider()
 
@@ -24,14 +27,18 @@ struct MenuBarContentView: View {
 
         Divider()
 
-        Button("Open Settings") {
+        Button {
             openSettingsWindow()
+        } label: {
+            Label("Open Settings", systemImage: "gearshape")
         }
 
         Divider()
 
-        Button("Quit XDRSwitcher") {
+        Button {
             NSApplication.shared.terminate(nil)
+        } label: {
+            Label("Quit XDRSwitcher", systemImage: "xmark.square")
         }
     }
 
@@ -40,10 +47,36 @@ struct MenuBarContentView: View {
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
+    private func showAboutDialog() {
+        let alert = NSAlert()
+        alert.icon = NSApplication.shared.applicationIconImage
+        alert.messageText = "About XDRSwitcher"
+        alert.informativeText = "\(aboutTitle)\nSeo, Se-young\nssy523a@gmail.com"
+        alert.addButton(withTitle: "OK")
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
     private var automaticSwitchingBinding: Binding<Bool> {
         Binding(
             get: { appState.isAutomaticSwitchingEnabled },
             set: { appState.setAutomaticSwitchingEnabled($0) }
         )
+    }
+
+    private var aboutTitle: String {
+        let appName = Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "XDRSwitcher"
+        let shortVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let buildVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+
+        if let shortVersion, let buildVersion {
+            return "\(appName) \(shortVersion) (\(buildVersion))"
+        }
+
+        if let shortVersion {
+            return "\(appName) \(shortVersion)"
+        }
+
+        return appName
     }
 }
