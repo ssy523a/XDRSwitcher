@@ -6,6 +6,7 @@ struct XDRSwitcherApp: App {
     @State private var appState = AppState()
     @State private var activeApplicationMonitor = ActiveApplicationMonitor()
     @State private var referenceModeRuleEngine = ReferenceModeRuleEngine()
+    @State private var systemEventMonitor = SystemEventMonitor()
 
     init() {
         NSApplication.shared.setActivationPolicy(.accessory)
@@ -15,7 +16,7 @@ struct XDRSwitcherApp: App {
         MenuBarExtra {
             MenuBarContentView(appState: $appState)
                 .task {
-                    startActiveApplicationMonitoring()
+                    startApplicationServices()
                 }
                 .onChange(of: appState.settings) {
                     reevaluateReferenceModeAutomation()
@@ -23,14 +24,14 @@ struct XDRSwitcherApp: App {
         } label: {
             Label("XDRSwitcher", systemImage: "display")
                 .task {
-                    startActiveApplicationMonitoring()
+                    startApplicationServices()
                 }
         }
 
         Settings {
             SettingsView(appState: $appState)
                 .task {
-                    startActiveApplicationMonitoring()
+                    startApplicationServices()
                 }
                 .onChange(of: appState.settings) {
                     reevaluateReferenceModeAutomation()
@@ -39,11 +40,51 @@ struct XDRSwitcherApp: App {
     }
 
     @MainActor
+    private func startApplicationServices() {
+        startActiveApplicationMonitoring()
+        startSystemEventMonitoring()
+    }
+
+    @MainActor
     private func startActiveApplicationMonitoring() {
         activeApplicationMonitor.start { activeApplication in
             appState.updateActiveApplication(activeApplication)
             evaluateReferenceModeAutomation(for: activeApplication)
         }
+    }
+
+    @MainActor
+    private func startSystemEventMonitoring() {
+        systemEventMonitor.start(
+            onWillTerminate: {
+                cancelPendingReferenceModeSwitch()
+            },
+            onWillSleep: {
+                cancelPendingReferenceModeSwitch()
+            },
+            onDidWake: {
+                refreshReferenceModesAndReevaluateAutomation()
+            },
+            onDisplayConfigurationWillChange: {
+                cancelPendingReferenceModeSwitch()
+            },
+            onDisplayConfigurationDidChange: {
+                refreshReferenceModesAndReevaluateAutomation()
+            }
+        )
+    }
+
+    @MainActor
+    private func cancelPendingReferenceModeSwitch() {
+        referenceModeRuleEngine.cancelPendingSwitch()
+        appState.setAutomaticSwitchingPending(false)
+    }
+
+    @MainActor
+    private func refreshReferenceModesAndReevaluateAutomation() {
+        cancelPendingReferenceModeSwitch()
+        appState.refreshReferenceModes()
+        reevaluateReferenceModeAutomation()
     }
 
     @MainActor

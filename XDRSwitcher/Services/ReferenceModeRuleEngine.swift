@@ -30,6 +30,7 @@ final class ReferenceModeRuleEngine {
     private let displayPresetService: any DisplayPresetServicing
     private let ownBundleIdentifier: String?
     private var pendingTask: Task<Void, Never>?
+    private var pendingTaskID: UUID?
     private var isApplyingPreset = false
     private var lastExternalApplicationInfo: ActiveApplicationInfo?
     private var lastReportedError: String?
@@ -48,6 +49,12 @@ final class ReferenceModeRuleEngine {
 
     deinit {
         pendingTask?.cancel()
+    }
+
+    func cancelPendingSwitch() {
+        pendingTask?.cancel()
+        pendingTask = nil
+        pendingTaskID = nil
     }
 
     func handleActiveApplicationChange(
@@ -93,7 +100,7 @@ final class ReferenceModeRuleEngine {
         onApplied: @escaping @MainActor (DisplayPresetSnapshot) -> Void
     ) {
         guard let activeApplicationInfo = currentFrontmostApplication() else {
-            pendingTask?.cancel()
+            cancelPendingSwitch()
             onPendingChange(false)
             return
         }
@@ -175,7 +182,7 @@ final class ReferenceModeRuleEngine {
         onError: @escaping @MainActor (String?) -> Void,
         onApplied: @escaping @MainActor (DisplayPresetSnapshot) -> Void
     ) {
-        pendingTask?.cancel()
+        cancelPendingSwitch()
 
         guard settings.automaticSwitchingEnabled else {
             onPendingChange(false)
@@ -234,6 +241,8 @@ final class ReferenceModeRuleEngine {
             return
         }
 
+        let taskID = UUID()
+        pendingTaskID = taskID
         onPendingChange(true)
 
         pendingTask = Task { [weak self] in
@@ -243,14 +252,24 @@ final class ReferenceModeRuleEngine {
                 try await Task.sleep(nanoseconds: nanoseconds)
             } catch {
                 await MainActor.run {
+                    guard self?.pendingTaskID == taskID else {
+                        return
+                    }
+
+                    self?.pendingTask = nil
+                    self?.pendingTaskID = nil
                     onPendingChange(false)
                 }
                 return
             }
 
             await MainActor.run {
-                guard let self, !Task.isCancelled else {
+                guard let self else {
                     onPendingChange(false)
+                    return
+                }
+
+                guard self.pendingTaskID == taskID, !Task.isCancelled else {
                     return
                 }
 
@@ -269,6 +288,8 @@ final class ReferenceModeRuleEngine {
                     onError: onError,
                     onApplied: onApplied
                 )
+                self.pendingTask = nil
+                self.pendingTaskID = nil
             }
         }
     }

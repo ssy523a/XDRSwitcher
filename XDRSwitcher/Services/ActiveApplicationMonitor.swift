@@ -75,7 +75,7 @@ final class ActiveApplicationMonitor {
             }
 
             let applicationInfo = Self.info(from: application)
-            MainActor.assumeIsolated {
+            Task { @MainActor [weak self] in
                 self?.onActiveApplicationChange?(applicationInfo)
             }
         }

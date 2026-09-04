@@ -51,7 +51,7 @@ struct MenuBarContentView: View {
         let alert = NSAlert()
         alert.icon = NSApplication.shared.applicationIconImage
         alert.messageText = "About XDRSwitcher"
-        alert.informativeText = "\(aboutTitle)\nSeo, Se-young\nssy523a@gmail.com"
+        alert.informativeText = "\(aboutTitle)\nSeo, Se-young\nssy523a@gmail.com\n\nThis app uses dynamically loaded private CoreDisplay APIs to read and change Reference Modes. macOS updates may change or remove that behavior."
         alert.addButton(withTitle: "OK")
         NSApplication.shared.activate(ignoringOtherApps: true)
         alert.runModal()
