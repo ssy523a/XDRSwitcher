@@ -20,6 +20,7 @@ struct MenuBarContentView: View {
 
         Text("Current Application: \(appState.currentApplicationName)")
         Text("Current Reference Mode: \(appState.currentReferenceModeName)")
+        Text("Automatic Switching: \(automaticSwitchingStatusText)")
 
         if let automaticSwitchingErrorMessage = appState.automaticSwitchingErrorMessage {
             Text("Recent Error: \(automaticSwitchingErrorMessage)")
@@ -78,5 +79,12 @@ struct MenuBarContentView: View {
         }
 
         return appName
+    }
+
+    private var automaticSwitchingStatusText: String {
+        if let remainingSeconds = appState.automaticSwitchingRemainingSeconds {
+            return "\(appState.automaticSwitchingStatus.rawValue): \(remainingSeconds)s"
+        }
+        return appState.automaticSwitchingStatus.rawValue
     }
 }

@@ -18,6 +18,8 @@ struct AppState {
     var isPendingReferenceModeSwitch = false
     var isRefreshingReferenceModes = false
     var isApplyingReferenceMode = false
+    var automaticSwitchingStatus = ReferenceModeAutomationStatus.paused
+    var automaticSwitchingRemainingSeconds: Int?
 
     private var settingsStore: SettingsStore
     private var launchAtLoginService: any LaunchAtLoginServicing
@@ -118,7 +120,7 @@ struct AppState {
         print(
             "XDRSwitcher active application name=\(currentApplicationName) " +
             "bundleIdentifier=\(currentApplicationBundleIdentifier) " +
-            "path=\(currentApplicationPath ?? "Not Available")"
+            "pid=\(applicationInfo.processIdentifier)"
         )
     }
 
@@ -216,6 +218,14 @@ struct AppState {
 
     mutating func setAutomaticSwitchingPending(_ isPending: Bool) {
         isPendingReferenceModeSwitch = isPending
+    }
+
+    mutating func setAutomaticSwitchingStatus(
+        _ status: ReferenceModeAutomationStatus,
+        remainingSeconds: Int? = nil
+    ) {
+        automaticSwitchingStatus = status
+        automaticSwitchingRemainingSeconds = remainingSeconds
     }
 
     mutating func setTargetReferenceModeName(_ name: String) {

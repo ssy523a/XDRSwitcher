@@ -5,14 +5,17 @@ struct ActiveApplicationInfo: Equatable {
     let localizedName: String
     let bundleIdentifier: String?
     let bundleURL: URL?
+    let processIdentifier: pid_t
 
     var displayName: String {
-        if !localizedName.isEmpty {
-            return localizedName
-        }
-
-        return bundleIdentifier ?? "Not Available"
+        localizedName.isEmpty ? (bundleIdentifier ?? "Not Available") : localizedName
     }
+}
+
+enum ApplicationLifecycleEvent: Equatable {
+    case launched(ActiveApplicationInfo)
+    case activated(ActiveApplicationInfo)
+    case terminated(ActiveApplicationInfo)
 }
 
 protocol ActiveApplicationWorkspaceProviding {
@@ -21,71 +24,69 @@ protocol ActiveApplicationWorkspaceProviding {
 }
 
 struct ActiveApplicationWorkspace: ActiveApplicationWorkspaceProviding {
-    var frontmostApplication: NSRunningApplication? {
-        NSWorkspace.shared.frontmostApplication
-    }
-
-    var notificationCenter: NotificationCenter {
-        NSWorkspace.shared.notificationCenter
-    }
+    var frontmostApplication: NSRunningApplication? { NSWorkspace.shared.frontmostApplication }
+    var notificationCenter: NotificationCenter { NSWorkspace.shared.notificationCenter }
 }
 
 final class ActiveApplicationMonitor {
     private let workspace: any ActiveApplicationWorkspaceProviding
-    private var activationObserver: NSObjectProtocol?
-    private var onActiveApplicationChange: (@MainActor (ActiveApplicationInfo) -> Void)?
+    private var observers: [NSObjectProtocol] = []
+    private var onEvent: (@MainActor (ApplicationLifecycleEvent) -> Void)?
 
     init(workspace: any ActiveApplicationWorkspaceProviding = ActiveApplicationWorkspace()) {
         self.workspace = workspace
     }
 
     deinit {
-        if let activationObserver {
-            workspace.notificationCenter.removeObserver(activationObserver)
+        for observer in observers {
+            workspace.notificationCenter.removeObserver(observer)
         }
-    }
-
-    func currentApplicationInfo() -> ActiveApplicationInfo? {
-        guard let frontmostApplication = workspace.frontmostApplication else {
-            return nil
-        }
-
-        return Self.info(from: frontmostApplication)
     }
 
     @MainActor
-    func start(onChange: @escaping @MainActor (ActiveApplicationInfo) -> Void) {
-        onActiveApplicationChange = onChange
-
-        if let frontmostApplication = workspace.frontmostApplication {
-            onChange(Self.info(from: frontmostApplication))
-        }
-
-        guard activationObserver == nil else {
-            return
-        }
-
-        activationObserver = workspace.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] notification in
-            guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
-                return
-            }
-
-            let applicationInfo = Self.info(from: application)
-            Task { @MainActor [weak self] in
-                self?.onActiveApplicationChange?(applicationInfo)
-            }
-        }
+    func currentApplicationInfo() -> ActiveApplicationInfo? {
+        workspace.frontmostApplication.map(Self.info)
     }
 
+    @MainActor
+    func start(onEvent: @escaping @MainActor (ApplicationLifecycleEvent) -> Void) {
+        self.onEvent = onEvent
+
+        if let application = workspace.frontmostApplication {
+            onEvent(.activated(Self.info(from: application)))
+        }
+
+        guard observers.isEmpty else { return }
+
+        observe(NSWorkspace.didLaunchApplicationNotification, event: ApplicationLifecycleEvent.launched)
+        observe(NSWorkspace.didActivateApplicationNotification, event: ApplicationLifecycleEvent.activated)
+        observe(NSWorkspace.didTerminateApplicationNotification, event: ApplicationLifecycleEvent.terminated)
+    }
+
+    @MainActor
+    private func observe(
+        _ name: Notification.Name,
+        event: @escaping (ActiveApplicationInfo) -> ApplicationLifecycleEvent
+    ) {
+        observers.append(
+            workspace.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
+                guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
+                    return
+                }
+                Task { @MainActor [weak self] in
+                    self?.onEvent?(event(Self.info(from: application)))
+                }
+            }
+        )
+    }
+
+    @MainActor
     private static func info(from application: NSRunningApplication) -> ActiveApplicationInfo {
         ActiveApplicationInfo(
             localizedName: application.localizedName ?? "",
             bundleIdentifier: application.bundleIdentifier,
-            bundleURL: application.bundleURL
+            bundleURL: application.bundleURL,
+            processIdentifier: application.processIdentifier
         )
     }
 }

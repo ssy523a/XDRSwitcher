@@ -14,26 +14,44 @@ enum ReferenceModeRuleTargetSource: Equatable {
 enum ReferenceModeRuleEngineError: LocalizedError, Equatable {
     case missingDefaultPreset
     case unavailablePreset(name: String, uniqueID: String)
+    case displayReconfigurationTimedOut
 
     var errorDescription: String? {
         switch self {
         case .missingDefaultPreset:
-            return "Automatic Switching is enabled, but Default Reference Mode is not set or is unavailable."
+            "Automatic Switching is enabled, but Default Reference Mode is not set or is unavailable."
         case let .unavailablePreset(name, uniqueID):
-            return "Automatic Switching cannot use \(name) because it is not available on the current display. Preset ID: \(uniqueID)"
+            "Automatic Switching cannot use \(name) because it is not available on the current display. Preset ID: \(uniqueID)"
+        case .displayReconfigurationTimedOut:
+            "Automatic switching was cancelled because the display did not finish reconfiguring safely."
         }
     }
 }
 
 @MainActor
 final class ReferenceModeRuleEngine {
+    typealias UptimeProvider = () -> TimeInterval
+
+    private struct PendingRequest: Equatable {
+        let application: ActiveApplicationInfo
+        let targetID: String
+    }
+
     private let displayPresetService: any DisplayPresetServicing
     private let ownBundleIdentifier: String?
+    private let policy: ReferenceModeSafetyPolicy
+    private let uptime: UptimeProvider
+
     private var pendingTask: Task<Void, Never>?
-    private var pendingTaskID: UUID?
-    private var isApplyingPreset = false
+    private var pendingRequest: PendingRequest?
+    private var launchedAtByPID: [pid_t: TimeInterval] = [:]
     private var lastExternalApplicationInfo: ActiveApplicationInfo?
-    private var lastReportedError: String?
+    private var lastSwitchUptime: TimeInterval?
+    private var lastDisplayChangeUptime: TimeInterval?
+    private var lastSystemEventUptime: TimeInterval?
+    private var displayConfigurationBeganUptime: TimeInterval?
+    private var isApplyingPreset = false
+    private(set) var isPaused = false
 
     convenience init() {
         self.init(
@@ -42,47 +60,105 @@ final class ReferenceModeRuleEngine {
         )
     }
 
-    init(displayPresetService: any DisplayPresetServicing, ownBundleIdentifier: String?) {
+    init(
+        displayPresetService: any DisplayPresetServicing,
+        ownBundleIdentifier: String?,
+        policy: ReferenceModeSafetyPolicy? = nil,
+        uptime: @escaping UptimeProvider = { ProcessInfo.processInfo.systemUptime }
+    ) {
         self.displayPresetService = displayPresetService
         self.ownBundleIdentifier = ownBundleIdentifier
+        self.policy = policy ?? .standard
+        self.uptime = uptime
     }
 
     deinit {
         pendingTask?.cancel()
     }
 
-    func cancelPendingSwitch() {
+    func setPaused(_ paused: Bool) {
+        isPaused = paused
+        if paused {
+            cancelPendingSwitch(reason: "automation paused")
+        }
+    }
+
+    func recordLaunch(_ application: ActiveApplicationInfo, settings: XDRSwitcherSettings) {
+        guard let bundleIdentifier = application.bundleIdentifier,
+              settings.appRules.contains(where: { $0.enabled && $0.bundleIdentifier == bundleIdentifier }) else {
+            return
+        }
+        launchedAtByPID[application.processIdentifier] = uptime()
+        log(application, coldLaunch: true, target: nil, message: "launch recorded")
+    }
+
+    func recordTermination(_ application: ActiveApplicationInfo) {
+        launchedAtByPID.removeValue(forKey: application.processIdentifier)
+        if pendingRequest?.application.processIdentifier == application.processIdentifier {
+            cancelPendingSwitch(reason: "scheduled application terminated")
+        }
+    }
+
+    func displayReconfigurationBegan(
+        onStatusChange: @escaping @MainActor (ReferenceModeAutomationStatus, Int?) -> Void
+    ) {
+        displayConfigurationBeganUptime = uptime()
+        cancelPendingSwitch(reason: "display reconfiguration began")
+        onStatusChange(.waitingForDisplayStabilization, Int(ceil(policy.displayReconfigurationTimeout)))
+        print("XDRSwitcher display reconfiguration begin")
+    }
+
+    func displayReconfigurationEnded() {
+        displayConfigurationBeganUptime = nil
+        lastDisplayChangeUptime = uptime()
+        lastSystemEventUptime = uptime()
+        print("XDRSwitcher display reconfiguration end")
+    }
+
+    func systemDidWake() {
+        lastSystemEventUptime = uptime()
+        cancelPendingSwitch(reason: "system wake")
+    }
+
+    func cancelPendingSwitch(reason: String = "explicit cancellation") {
+        if pendingTask != nil {
+            print("XDRSwitcher pending switch cancelled reason=\(reason)")
+        }
         pendingTask?.cancel()
         pendingTask = nil
-        pendingTaskID = nil
+        pendingRequest = nil
     }
 
     func handleActiveApplicationChange(
-        _ activeApplicationInfo: ActiveApplicationInfo,
+        _ application: ActiveApplicationInfo,
         settings: XDRSwitcherSettings,
         currentReferencePresetID: String?,
         availableReferencePresets: [ReferencePreset],
         currentFrontmostApplication: @escaping @MainActor () -> ActiveApplicationInfo?,
+        currentSettings: @escaping @MainActor () -> XDRSwitcherSettings,
+        currentPresets: @escaping @MainActor () -> [ReferencePreset],
+        currentPresetID: @escaping @MainActor () -> String?,
         onPendingChange: @escaping @MainActor (Bool) -> Void,
+        onStatusChange: @escaping @MainActor (ReferenceModeAutomationStatus, Int?) -> Void,
         onTargetChange: @escaping @MainActor (String) -> Void,
         onError: @escaping @MainActor (String?) -> Void,
         onApplied: @escaping @MainActor (DisplayPresetSnapshot) -> Void
     ) {
-        guard activeApplicationInfo.bundleIdentifier != ownBundleIdentifier else {
-            return
+        guard application.bundleIdentifier != ownBundleIdentifier else { return }
+        if application.bundleIdentifier != nil {
+            lastExternalApplicationInfo = application
         }
-
-        if activeApplicationInfo.bundleIdentifier != nil {
-            lastExternalApplicationInfo = activeApplicationInfo
-        }
-
         evaluate(
-            activeApplicationInfo: activeApplicationInfo,
+            application: application,
             settings: settings,
             currentReferencePresetID: currentReferencePresetID,
             availableReferencePresets: availableReferencePresets,
             currentFrontmostApplication: currentFrontmostApplication,
+            currentSettings: currentSettings,
+            currentPresets: currentPresets,
+            currentPresetID: currentPresetID,
             onPendingChange: onPendingChange,
+            onStatusChange: onStatusChange,
             onTargetChange: onTargetChange,
             onError: onError,
             onApplied: onApplied
@@ -94,40 +170,33 @@ final class ReferenceModeRuleEngine {
         currentReferencePresetID: String?,
         availableReferencePresets: [ReferencePreset],
         currentFrontmostApplication: @escaping @MainActor () -> ActiveApplicationInfo?,
+        currentSettings: @escaping @MainActor () -> XDRSwitcherSettings,
+        currentPresets: @escaping @MainActor () -> [ReferencePreset],
+        currentPresetID: @escaping @MainActor () -> String?,
         onPendingChange: @escaping @MainActor (Bool) -> Void,
+        onStatusChange: @escaping @MainActor (ReferenceModeAutomationStatus, Int?) -> Void,
         onTargetChange: @escaping @MainActor (String) -> Void,
         onError: @escaping @MainActor (String?) -> Void,
         onApplied: @escaping @MainActor (DisplayPresetSnapshot) -> Void
     ) {
-        guard let activeApplicationInfo = currentFrontmostApplication() else {
-            cancelPendingSwitch()
+        guard let frontmost = currentFrontmostApplication() else {
+            cancelPendingSwitch(reason: "frontmost application unavailable")
             onPendingChange(false)
             return
         }
-
-        if activeApplicationInfo.bundleIdentifier == ownBundleIdentifier,
-           let lastExternalApplicationInfo {
-            evaluate(
-                activeApplicationInfo: lastExternalApplicationInfo,
-                settings: settings,
-                currentReferencePresetID: currentReferencePresetID,
-                availableReferencePresets: availableReferencePresets,
-                currentFrontmostApplication: currentFrontmostApplication,
-                onPendingChange: onPendingChange,
-                onTargetChange: onTargetChange,
-                onError: onError,
-                onApplied: onApplied
-            )
-            return
-        }
-
+        let application = frontmost.bundleIdentifier == ownBundleIdentifier ? lastExternalApplicationInfo : frontmost
+        guard let application else { return }
         handleActiveApplicationChange(
-            activeApplicationInfo,
+            application,
             settings: settings,
             currentReferencePresetID: currentReferencePresetID,
             availableReferencePresets: availableReferencePresets,
             currentFrontmostApplication: currentFrontmostApplication,
+            currentSettings: currentSettings,
+            currentPresets: currentPresets,
+            currentPresetID: currentPresetID,
             onPendingChange: onPendingChange,
+            onStatusChange: onStatusChange,
             onTargetChange: onTargetChange,
             onError: onError,
             onApplied: onApplied
@@ -139,13 +208,7 @@ final class ReferenceModeRuleEngine {
         settings: XDRSwitcherSettings,
         availableReferencePresets: [ReferencePreset] = []
     ) throws -> ReferenceModeRuleTarget? {
-        guard settings.automaticSwitchingEnabled else {
-            return nil
-        }
-
-        guard let bundleIdentifier else {
-            return nil
-        }
+        guard settings.automaticSwitchingEnabled, let bundleIdentifier else { return nil }
 
         if let rule = settings.appRules.first(where: { $0.enabled && $0.bundleIdentifier == bundleIdentifier }) {
             let target = ReferenceModeRuleTarget(
@@ -157,189 +220,282 @@ final class ReferenceModeRuleEngine {
             return target
         }
 
-        guard let defaultPresetUniqueID = settings.defaultPresetUniqueID,
-              let defaultPresetName = settings.defaultPresetName else {
+        guard let uniqueID = settings.defaultPresetUniqueID, let name = settings.defaultPresetName else {
             throw ReferenceModeRuleEngineError.missingDefaultPreset
         }
-
-        let target = ReferenceModeRuleTarget(
-            uniqueID: defaultPresetUniqueID,
-            name: defaultPresetName,
-            source: .defaultPreset
-        )
+        let target = ReferenceModeRuleTarget(uniqueID: uniqueID, name: name, source: .defaultPreset)
         try validate(target, availableReferencePresets: availableReferencePresets)
         return target
     }
 
     private func evaluate(
-        activeApplicationInfo: ActiveApplicationInfo,
+        application: ActiveApplicationInfo,
         settings: XDRSwitcherSettings,
         currentReferencePresetID: String?,
         availableReferencePresets: [ReferencePreset],
         currentFrontmostApplication: @escaping @MainActor () -> ActiveApplicationInfo?,
+        currentSettings: @escaping @MainActor () -> XDRSwitcherSettings,
+        currentPresets: @escaping @MainActor () -> [ReferencePreset],
+        currentPresetID: @escaping @MainActor () -> String?,
         onPendingChange: @escaping @MainActor (Bool) -> Void,
+        onStatusChange: @escaping @MainActor (ReferenceModeAutomationStatus, Int?) -> Void,
         onTargetChange: @escaping @MainActor (String) -> Void,
         onError: @escaping @MainActor (String?) -> Void,
         onApplied: @escaping @MainActor (DisplayPresetSnapshot) -> Void
     ) {
-        cancelPendingSwitch()
-
-        guard settings.automaticSwitchingEnabled else {
+        guard settings.automaticSwitchingEnabled, !isPaused else {
+            cancelPendingSwitch(reason: "automatic switching disabled or paused")
             onPendingChange(false)
+            onStatusChange(.paused, nil)
             onTargetChange("Not Available")
-            onError(nil)
-            lastReportedError = nil
             return
         }
 
         do {
             guard let target = try Self.targetPreset(
-                for: activeApplicationInfo.bundleIdentifier,
+                for: application.bundleIdentifier,
                 settings: settings,
                 availableReferencePresets: availableReferencePresets
-            ) else {
-                onPendingChange(false)
-                return
-            }
+            ) else { return }
 
             onTargetChange(target.name)
-
             if currentReferencePresetID == target.uniqueID {
+                cancelPendingSwitch(reason: "target preset already active")
                 onPendingChange(false)
+                onStatusChange(.ready, nil)
                 onError(nil)
-                lastReportedError = nil
                 return
             }
 
-            scheduleSwitch(
-                target: target,
-                scheduledBundleIdentifier: activeApplicationInfo.bundleIdentifier,
-                delaySeconds: settings.switchDelaySeconds,
+            let request = PendingRequest(application: application, targetID: target.uniqueID)
+            if request == pendingRequest { return }
+            cancelPendingSwitch(reason: "new active application event")
+            schedule(
+                request: request,
+                debounce: settings.switchDelaySeconds,
                 currentFrontmostApplication: currentFrontmostApplication,
+                currentSettings: currentSettings,
+                currentPresets: currentPresets,
+                currentPresetID: currentPresetID,
                 onPendingChange: onPendingChange,
+                onStatusChange: onStatusChange,
+                onTargetChange: onTargetChange,
                 onError: onError,
                 onApplied: onApplied
             )
         } catch {
-            report(error.localizedDescription, onError: onError)
+            cancelPendingSwitch(reason: "target preset validation failed")
             onPendingChange(false)
             onTargetChange("Not Available")
+            onError(error.localizedDescription)
         }
     }
 
-    private func scheduleSwitch(
-        target: ReferenceModeRuleTarget,
-        scheduledBundleIdentifier: String?,
-        delaySeconds: Double,
+    private func schedule(
+        request: PendingRequest,
+        debounce: TimeInterval,
         currentFrontmostApplication: @escaping @MainActor () -> ActiveApplicationInfo?,
+        currentSettings: @escaping @MainActor () -> XDRSwitcherSettings,
+        currentPresets: @escaping @MainActor () -> [ReferencePreset],
+        currentPresetID: @escaping @MainActor () -> String?,
         onPendingChange: @escaping @MainActor (Bool) -> Void,
+        onStatusChange: @escaping @MainActor (ReferenceModeAutomationStatus, Int?) -> Void,
+        onTargetChange: @escaping @MainActor (String) -> Void,
         onError: @escaping @MainActor (String?) -> Void,
         onApplied: @escaping @MainActor (DisplayPresetSnapshot) -> Void
     ) {
-        guard scheduledBundleIdentifier != nil else {
-            onPendingChange(false)
-            return
+        guard request.application.bundleIdentifier != nil else { return }
+
+        let now = uptime()
+        let coldLaunchUptime = launchedAtByPID[request.application.processIdentifier]
+        let delay: TimeInterval
+        let status: ReferenceModeAutomationStatus
+
+        if let began = displayConfigurationBeganUptime {
+            let elapsed = now - began
+            if elapsed >= policy.displayReconfigurationTimeout {
+                onError(ReferenceModeRuleEngineError.displayReconfigurationTimedOut.localizedDescription)
+                onStatusChange(.waitingForDisplayStabilization, 0)
+                return
+            }
+            delay = policy.displayReconfigurationTimeout - elapsed
+            status = .waitingForDisplayStabilization
+        } else {
+            let decision = waitingDecision(now: now, launchUptime: coldLaunchUptime, debounce: debounce)
+            if isApplyingPreset {
+                delay = max(decision.delay, policy.verificationFallbackDelay + policy.postSwitchCooldown)
+                status = .coolingDown
+            } else {
+                delay = decision.delay
+                status = decision.status
+            }
         }
 
-        let taskID = UUID()
-        pendingTaskID = taskID
+        pendingRequest = request
         onPendingChange(true)
+        onStatusChange(status, Self.countdownSeconds(for: status, delay: delay))
+        log(request.application, coldLaunch: coldLaunchUptime != nil, target: request.targetID, message: "wait=\(delay)s reason=\(status.rawValue)")
 
         pendingTask = Task { [weak self] in
-            let nanoseconds = UInt64(max(delaySeconds, 0) * 1_000_000_000)
-
             do {
-                try await Task.sleep(nanoseconds: nanoseconds)
-            } catch {
-                await MainActor.run {
-                    guard self?.pendingTaskID == taskID else {
-                        return
+                var remainingDelay = delay
+                while remainingDelay > 0 {
+                    let interval = min(1, remainingDelay)
+                    try await Task.sleep(for: .seconds(interval))
+                    try Task.checkCancellation()
+                    remainingDelay = max(0, remainingDelay - interval)
+                    if remainingDelay > 0,
+                       let seconds = Self.countdownSeconds(for: status, delay: remainingDelay) {
+                        onStatusChange(status, seconds)
                     }
-
-                    self?.pendingTask = nil
-                    self?.pendingTaskID = nil
-                    onPendingChange(false)
                 }
+            } catch {
+                return
+            }
+            guard let self, self.pendingRequest == request else { return }
+
+            if self.displayConfigurationBeganUptime != nil {
+                self.pendingTask = nil
+                self.pendingRequest = nil
+                onPendingChange(false)
+                onError(ReferenceModeRuleEngineError.displayReconfigurationTimedOut.localizedDescription)
                 return
             }
 
-            await MainActor.run {
-                guard let self else {
+            let frontmost = currentFrontmostApplication()
+            let confirmed = frontmost?.bundleIdentifier == self.ownBundleIdentifier ? self.lastExternalApplicationInfo : frontmost
+            guard confirmed?.bundleIdentifier == request.application.bundleIdentifier,
+                  confirmed?.processIdentifier == request.application.processIdentifier else {
+                self.cancelPendingSwitch(reason: "frontmost application or PID changed")
+                onPendingChange(false)
+                return
+            }
+
+            let latestSettings = currentSettings()
+            guard latestSettings.automaticSwitchingEnabled, !self.isPaused else {
+                self.cancelPendingSwitch(reason: "automatic switching disabled before execution")
+                onPendingChange(false)
+                onStatusChange(.paused, nil)
+                return
+            }
+
+            do {
+                guard let latestTarget = try Self.targetPreset(
+                    for: confirmed?.bundleIdentifier,
+                    settings: latestSettings,
+                    availableReferencePresets: currentPresets()
+                ), latestTarget.uniqueID == request.targetID else {
+                    self.cancelPendingSwitch(reason: "target changed before execution")
                     onPendingChange(false)
                     return
                 }
 
-                guard self.pendingTaskID == taskID, !Task.isCancelled else {
-                    return
-                }
-
-                let confirmedApplicationInfo = currentFrontmostApplication()
-                let confirmedBundleIdentifier = confirmedApplicationInfo?.bundleIdentifier
-
-                if confirmedBundleIdentifier != self.ownBundleIdentifier,
-                   confirmedBundleIdentifier != scheduledBundleIdentifier {
+                if currentPresetID() == latestTarget.uniqueID {
+                    self.cancelPendingSwitch(reason: "target preset became active")
                     onPendingChange(false)
+                    onStatusChange(.ready, nil)
                     return
                 }
 
-                self.apply(
-                    target: target,
-                    onPendingChange: onPendingChange,
-                    onError: onError,
-                    onApplied: onApplied
-                )
+                guard !self.isApplyingPreset else { return }
                 self.pendingTask = nil
-                self.pendingTaskID = nil
+                self.pendingRequest = nil
+                self.isApplyingPreset = true
+                onPendingChange(false)
+                onStatusChange(.switching, nil)
+                onTargetChange(latestTarget.name)
+                onError(nil)
+                self.log(request.application, coldLaunch: coldLaunchUptime != nil, target: latestTarget.name, message: "switching")
+
+                do {
+                    let snapshot = try await self.displayPresetService.applyPresetForAutomaticSwitch(uniqueID: latestTarget.uniqueID)
+                    self.lastSwitchUptime = self.uptime()
+                    self.isApplyingPreset = false
+                    onApplied(snapshot)
+                    onStatusChange(.coolingDown, nil)
+                    print("XDRSwitcher cooldown start duration=\(self.policy.postSwitchCooldown)s")
+                    Task { @MainActor [weak self] in
+                        try? await Task.sleep(for: .seconds(self?.policy.postSwitchCooldown ?? 0))
+                        guard let self else { return }
+                        print("XDRSwitcher cooldown end")
+                        if self.pendingTask == nil {
+                            onStatusChange(.ready, nil)
+                        }
+                    }
+                } catch is CancellationError {
+                    self.isApplyingPreset = false
+                } catch {
+                    self.isApplyingPreset = false
+                    onError(error.localizedDescription)
+                    onStatusChange(.ready, nil)
+                }
+            } catch {
+                onError(error.localizedDescription)
             }
         }
     }
 
-    private func apply(
-        target: ReferenceModeRuleTarget,
-        onPendingChange: @escaping @MainActor (Bool) -> Void,
-        onError: @escaping @MainActor (String?) -> Void,
-        onApplied: @escaping @MainActor (DisplayPresetSnapshot) -> Void
-    ) {
-        guard !isApplyingPreset else {
-            onPendingChange(false)
-            return
+    private func waitingDecision(
+        now: TimeInterval,
+        launchUptime: TimeInterval?,
+        debounce: TimeInterval
+    ) -> (delay: TimeInterval, status: ReferenceModeAutomationStatus) {
+        var decision = (delay: max(0, debounce), status: ReferenceModeAutomationStatus.ready)
+
+        func consider(_ delay: TimeInterval, status: ReferenceModeAutomationStatus) {
+            let remaining = max(0, delay)
+            if remaining > decision.delay {
+                decision = (remaining, status)
+            }
         }
 
-        isApplyingPreset = true
-        defer {
-            isApplyingPreset = false
-            onPendingChange(false)
+        consider(policy.bootGracePeriod - now, status: .waitingForSystemStartup)
+        if let launchUptime {
+            consider(policy.coldLaunchDelay - (now - launchUptime), status: .waitingForApplicationInitialization)
         }
+        if let lastSwitchUptime {
+            consider(policy.postSwitchCooldown - (now - lastSwitchUptime), status: .coolingDown)
+        }
+        if let lastDisplayChangeUptime {
+            consider(policy.displayStableDelay - (now - lastDisplayChangeUptime), status: .waitingForDisplayStabilization)
+        }
+        if let lastSystemEventUptime {
+            consider(policy.systemEventGracePeriod - (now - lastSystemEventUptime), status: .waitingForDisplayStabilization)
+        }
+        return decision
+    }
 
-        do {
-            let snapshot = try displayPresetService.applyPreset(uniqueID: target.uniqueID)
-            lastReportedError = nil
-            onError(nil)
-            onApplied(snapshot)
-        } catch {
-            report(error.localizedDescription, onError: onError)
+    private static func countdownSeconds(
+        for status: ReferenceModeAutomationStatus,
+        delay: TimeInterval
+    ) -> Int? {
+        switch status {
+        case .waitingForSystemStartup, .waitingForApplicationInitialization, .waitingForDisplayStabilization:
+            return Int(ceil(max(0, delay)))
+        case .coolingDown, .ready, .switching, .paused:
+            return nil
         }
     }
 
-    private func report(_ message: String, onError: @escaping @MainActor (String?) -> Void) {
-        onError(message)
-
-        guard lastReportedError != message else {
-            return
-        }
-
-        lastReportedError = message
-        print("XDRSwitcher automatic switching error: \(message)")
+    private func log(
+        _ application: ActiveApplicationInfo,
+        coldLaunch: Bool,
+        target: String?,
+        message: String
+    ) {
+        print(
+            "XDRSwitcher automation uptime=\(uptime()) app=\(application.displayName) " +
+            "bundleIdentifier=\(application.bundleIdentifier ?? "Not Available") " +
+            "pid=\(application.processIdentifier) coldLaunch=\(coldLaunch) " +
+            "target=\(target ?? "Not Available") \(message)"
+        )
     }
 
     private static func validate(
         _ target: ReferenceModeRuleTarget,
         availableReferencePresets: [ReferencePreset]
     ) throws {
-        guard !availableReferencePresets.isEmpty else {
-            return
-        }
-
+        guard !availableReferencePresets.isEmpty else { return }
         guard availableReferencePresets.contains(where: { $0.uniqueID == target.uniqueID && $0.isValid }) else {
             throw ReferenceModeRuleEngineError.unavailablePreset(name: target.name, uniqueID: target.uniqueID)
         }

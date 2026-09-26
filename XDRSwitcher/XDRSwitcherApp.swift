@@ -15,74 +15,66 @@ struct XDRSwitcherApp: App {
     var body: some Scene {
         MenuBarExtra {
             MenuBarContentView(appState: $appState)
-                .task {
-                    startApplicationServices()
-                }
-                .onChange(of: appState.settings) {
-                    reevaluateReferenceModeAutomation()
-                }
+                .task { startApplicationServices() }
+                .onChange(of: appState.settings) { reevaluateReferenceModeAutomation() }
         } label: {
             Label("XDRSwitcher", systemImage: "display")
-                .task {
-                    startApplicationServices()
-                }
+                .task { startApplicationServices() }
         }
 
         Settings {
             SettingsView(appState: $appState)
-                .task {
-                    startApplicationServices()
-                }
-                .onChange(of: appState.settings) {
-                    reevaluateReferenceModeAutomation()
-                }
+                .task { startApplicationServices() }
+                .onChange(of: appState.settings) { reevaluateReferenceModeAutomation() }
         }
     }
 
     @MainActor
     private func startApplicationServices() {
-        startActiveApplicationMonitoring()
-        startSystemEventMonitoring()
-    }
-
-    @MainActor
-    private func startActiveApplicationMonitoring() {
-        activeApplicationMonitor.start { activeApplication in
-            appState.updateActiveApplication(activeApplication)
-            evaluateReferenceModeAutomation(for: activeApplication)
+        activeApplicationMonitor.start { event in
+            switch event {
+            case let .launched(application):
+                referenceModeRuleEngine.recordLaunch(application, settings: appState.settings)
+            case let .activated(application):
+                appState.updateActiveApplication(application)
+                evaluateReferenceModeAutomation(for: application)
+            case let .terminated(application):
+                referenceModeRuleEngine.recordTermination(application)
+            }
         }
-    }
 
-    @MainActor
-    private func startSystemEventMonitoring() {
         systemEventMonitor.start(
             onWillTerminate: {
-                cancelPendingReferenceModeSwitch()
+                cancelPendingReferenceModeSwitch(reason: "application terminating")
             },
             onWillSleep: {
-                cancelPendingReferenceModeSwitch()
+                cancelPendingReferenceModeSwitch(reason: "system sleeping")
             },
             onDidWake: {
+                referenceModeRuleEngine.systemDidWake()
                 refreshReferenceModesAndReevaluateAutomation()
             },
             onDisplayConfigurationWillChange: {
-                cancelPendingReferenceModeSwitch()
+                referenceModeRuleEngine.displayReconfigurationBegan { status, remainingSeconds in
+                    appState.setAutomaticSwitchingStatus(status, remainingSeconds: remainingSeconds)
+                }
+                appState.setAutomaticSwitchingPending(false)
             },
             onDisplayConfigurationDidChange: {
+                referenceModeRuleEngine.displayReconfigurationEnded()
                 refreshReferenceModesAndReevaluateAutomation()
             }
         )
     }
 
     @MainActor
-    private func cancelPendingReferenceModeSwitch() {
-        referenceModeRuleEngine.cancelPendingSwitch()
+    private func cancelPendingReferenceModeSwitch(reason: String) {
+        referenceModeRuleEngine.cancelPendingSwitch(reason: reason)
         appState.setAutomaticSwitchingPending(false)
     }
 
     @MainActor
     private func refreshReferenceModesAndReevaluateAutomation() {
-        cancelPendingReferenceModeSwitch()
         appState.refreshReferenceModes()
         reevaluateReferenceModeAutomation()
     }
@@ -93,46 +85,34 @@ struct XDRSwitcherApp: App {
             settings: appState.settings,
             currentReferencePresetID: appState.currentReferencePresetID,
             availableReferencePresets: appState.availableReferencePresets,
-            currentFrontmostApplication: {
-                activeApplicationMonitor.currentApplicationInfo()
-            },
-            onPendingChange: { isPending in
-                appState.setAutomaticSwitchingPending(isPending)
-            },
-            onTargetChange: { targetName in
-                appState.setTargetReferenceModeName(targetName)
-            },
-            onError: { message in
-                appState.setAutomaticSwitchingErrorMessage(message)
-            },
-            onApplied: { snapshot in
-                appState.updateReferenceModesAfterAutomaticSwitch(with: snapshot)
-            }
+            currentFrontmostApplication: { activeApplicationMonitor.currentApplicationInfo() },
+            currentSettings: { appState.settings },
+            currentPresets: { appState.availableReferencePresets },
+            currentPresetID: { appState.currentReferencePresetID },
+            onPendingChange: { appState.setAutomaticSwitchingPending($0) },
+            onStatusChange: { appState.setAutomaticSwitchingStatus($0, remainingSeconds: $1) },
+            onTargetChange: { appState.setTargetReferenceModeName($0) },
+            onError: { appState.setAutomaticSwitchingErrorMessage($0) },
+            onApplied: { appState.updateReferenceModesAfterAutomaticSwitch(with: $0) }
         )
     }
 
     @MainActor
-    private func evaluateReferenceModeAutomation(for activeApplication: ActiveApplicationInfo) {
+    private func evaluateReferenceModeAutomation(for application: ActiveApplicationInfo) {
         referenceModeRuleEngine.handleActiveApplicationChange(
-            activeApplication,
+            application,
             settings: appState.settings,
             currentReferencePresetID: appState.currentReferencePresetID,
             availableReferencePresets: appState.availableReferencePresets,
-            currentFrontmostApplication: {
-                activeApplicationMonitor.currentApplicationInfo()
-            },
-            onPendingChange: { isPending in
-                appState.setAutomaticSwitchingPending(isPending)
-            },
-            onTargetChange: { targetName in
-                appState.setTargetReferenceModeName(targetName)
-            },
-            onError: { message in
-                appState.setAutomaticSwitchingErrorMessage(message)
-            },
-            onApplied: { snapshot in
-                appState.updateReferenceModesAfterAutomaticSwitch(with: snapshot)
-            }
+            currentFrontmostApplication: { activeApplicationMonitor.currentApplicationInfo() },
+            currentSettings: { appState.settings },
+            currentPresets: { appState.availableReferencePresets },
+            currentPresetID: { appState.currentReferencePresetID },
+            onPendingChange: { appState.setAutomaticSwitchingPending($0) },
+            onStatusChange: { appState.setAutomaticSwitchingStatus($0, remainingSeconds: $1) },
+            onTargetChange: { appState.setTargetReferenceModeName($0) },
+            onError: { appState.setAutomaticSwitchingErrorMessage($0) },
+            onApplied: { appState.updateReferenceModesAfterAutomaticSwitch(with: $0) }
         )
     }
 }
