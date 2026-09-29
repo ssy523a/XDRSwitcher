@@ -62,6 +62,7 @@ private final class AutomationHarness {
             displayPresetService: service,
             ownBundleIdentifier: "com.example.XDRSwitcher",
             policy: policy ?? .test,
+            switchDelayRange: 0...10,
             uptime: { now }
         )
     }
@@ -139,6 +140,13 @@ private extension XDRSwitcherSettings {
                 appPath: nil,
                 presetUniqueID: "rule",
                 presetName: "Rule"
+            ),
+            AppRule(
+                appDisplayName: "GeForce NOW",
+                bundleIdentifier: "com.nvidia.gfnpc.mall",
+                appPath: nil,
+                presetUniqueID: "rule",
+                presetName: "Rule"
             )
         ],
         switchDelaySeconds: 0.01,
@@ -165,6 +173,12 @@ private extension ActiveApplicationInfo {
         bundleURL: nil,
         processIdentifier: 303
     )
+    static let geforceNOW = ActiveApplicationInfo(
+        localizedName: "GeForce NOW",
+        bundleIdentifier: "com.nvidia.gfnpc.mall",
+        bundleURL: nil,
+        processIdentifier: 404
+    )
 }
 
 private func wait(_ duration: TimeInterval = 0.06) async {
@@ -174,25 +188,25 @@ private func wait(_ duration: TimeInterval = 0.06) async {
 @Suite("Reference Mode automatic-switch safety")
 @MainActor
 struct ReferenceModeSafetyTests {
-    @Test("Boot uptime below 120 seconds is held")
+    @Test("Boot uptime below 30 seconds is held")
     func bootGracePeriodHolds() {
         let delay = ReferenceModeSafetyPolicy.standard.requiredDelay(
             debounce: 0.7,
-            systemUptime: 71,
+            systemUptime: 25,
             launchUptime: nil,
             lastSwitchUptime: nil,
             lastDisplayChangeUptime: nil,
             systemEventUptime: nil
         )
-        #expect(delay == 49)
-        #expect(ReferenceModeSafetyPolicy.standard.bootGraceRemainingSeconds(systemUptime: 71.1) == 49)
+        #expect(delay == 5)
+        #expect(ReferenceModeSafetyPolicy.standard.bootGraceRemainingSeconds(systemUptime: 25.1) == 5)
     }
 
-    @Test("Boot uptime after 120 seconds allows normal debounce")
+    @Test("Boot uptime after 30 seconds allows normal debounce")
     func bootGracePeriodEnds() {
         let delay = ReferenceModeSafetyPolicy.standard.requiredDelay(
             debounce: 0.7,
-            systemUptime: 121,
+            systemUptime: 31,
             launchUptime: nil,
             lastSwitchUptime: nil,
             lastDisplayChangeUptime: nil,
@@ -205,8 +219,8 @@ struct ReferenceModeSafetyTests {
     func coldLaunchDelay() {
         let delay = ReferenceModeSafetyPolicy.standard.requiredDelay(
             debounce: 0.7,
-            systemUptime: 125,
-            launchUptime: 123,
+            systemUptime: 32,
+            launchUptime: 30,
             lastSwitchUptime: nil,
             lastDisplayChangeUptime: nil,
             systemEventUptime: nil
@@ -214,26 +228,83 @@ struct ReferenceModeSafetyTests {
         #expect(delay == 8)
     }
 
+    @Test("Boot at 25 seconds plus cold launch waits only until uptime 35")
+    func bootAndColdLaunchUseLatestDeadline() {
+        let delay = ReferenceModeSafetyPolicy.standard.requiredDelay(
+            debounce: 1,
+            systemUptime: 25,
+            launchUptime: 25,
+            lastSwitchUptime: nil,
+            lastDisplayChangeUptime: nil,
+            systemEventUptime: nil
+        )
+        #expect(delay == 10)
+    }
+
+    @Test("Saved normal delay is clamped without mutation")
+    func switchDelayClamp() {
+        #expect(XDRSwitcherSettings.defaults.switchDelaySeconds == 4.0)
+        var low = XDRSwitcherSettings.test
+        low.switchDelaySeconds = 0.1
+        #expect(low.safeSwitchDelaySeconds == 4.0)
+        #expect(low.switchDelaySeconds == 0.1)
+        var high = XDRSwitcherSettings.test
+        high.switchDelaySeconds = 9
+        #expect(high.safeSwitchDelaySeconds == 4.0)
+        #expect(high.switchDelaySeconds == 9)
+    }
+
+    @Test("Wake, display stabilization, and cooldown use their exact protection windows")
+    func protectionWindows() {
+        let wake = ReferenceModeSafetyPolicy.standard.requiredDelay(
+            debounce: 1, systemUptime: 100, launchUptime: nil, lastSwitchUptime: nil,
+            lastDisplayChangeUptime: nil, systemEventUptime: 97
+        )
+        let display = ReferenceModeSafetyPolicy.standard.requiredDelay(
+            debounce: 1, systemUptime: 100, launchUptime: nil, lastSwitchUptime: nil,
+            lastDisplayChangeUptime: 98, systemEventUptime: nil
+        )
+        let cooldown = ReferenceModeSafetyPolicy.standard.requiredDelay(
+            debounce: 1, systemUptime: 100, launchUptime: nil, lastSwitchUptime: 99,
+            lastDisplayChangeUptime: nil, systemEventUptime: nil
+        )
+        #expect(wake == 2)
+        #expect(display == 3)
+        #expect(cooldown == 2)
+    }
+
     @Test("Changing app during cold launch cancels request")
     func coldLaunchAppChange() async {
         let harness = AutomationHarness()
-        harness.engine.recordLaunch(.rule, settings: harness.settings)
-        harness.activate(.rule)
+        harness.engine.recordLaunch(.geforceNOW, settings: harness.settings)
+        harness.activate(.geforceNOW)
         harness.activate(.other)
         await wait()
         #expect(!harness.service.appliedIDs.contains("rule"))
     }
 
-    @Test("Changing PID during cold launch cancels request")
-    func coldLaunchPIDChange() async {
+    @Test("Already-running non-GeForce app uses normal debounce")
+    func runningApplicationUsesDebounce() async {
         let harness = AutomationHarness()
         harness.engine.recordLaunch(.rule, settings: harness.settings)
         harness.activate(.rule)
+        #expect(harness.status == .ready)
+        await wait(0.005)
+        #expect(harness.service.applyCount == 0)
+        await wait(0.02)
+        #expect(harness.service.applyCount == 1)
+    }
+
+    @Test("Changing PID during cold launch cancels request")
+    func coldLaunchPIDChange() async {
+        let harness = AutomationHarness()
+        harness.engine.recordLaunch(.geforceNOW, settings: harness.settings)
+        harness.activate(.geforceNOW)
         #expect(harness.status == .waitingForApplicationInitialization)
         #expect(harness.statusRemainingSeconds == 1)
         harness.frontmost = ActiveApplicationInfo(
             localizedName: "Rule App",
-            bundleIdentifier: "com.example.rule",
+            bundleIdentifier: "com.nvidia.gfnpc.mall",
             bundleURL: nil,
             processIdentifier: 999
         )
@@ -285,7 +356,7 @@ struct ReferenceModeSafetyTests {
         harness.activate(.rule)
         await wait()
         #expect(harness.service.applyCount == 0)
-        #expect(harness.error != nil)
+        #expect(harness.status == .waitingForDisplayStabilization)
     }
 
     @Test("Display stabilization delay is applied")

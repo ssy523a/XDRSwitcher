@@ -8,7 +8,13 @@ struct XDRSwitcherSettings: Codable, Equatable {
     var switchDelaySeconds: Double
     var launchAtLoginEnabled: Bool
 
-    static let defaultSwitchDelaySeconds = 0.7
+    static let defaultSwitchDelaySeconds = 4.0
+    static let minimumSwitchDelaySeconds = 4.0
+    static let maximumSwitchDelaySeconds = 4.0
+
+    var safeSwitchDelaySeconds: Double {
+        min(max(switchDelaySeconds, Self.minimumSwitchDelaySeconds), Self.maximumSwitchDelaySeconds)
+    }
 
     static let defaults = XDRSwitcherSettings(
         automaticSwitchingEnabled: false,

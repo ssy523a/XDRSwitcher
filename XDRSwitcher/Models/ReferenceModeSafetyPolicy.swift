@@ -10,10 +10,10 @@ struct ReferenceModeSafetyPolicy: Equatable {
     let displayReconfigurationTimeout: TimeInterval
 
     static let standard = ReferenceModeSafetyPolicy(
-        bootGracePeriod: 120,
+        bootGracePeriod: 30,
         coldLaunchDelay: 10,
         postSwitchCooldown: 3,
-        displayStableDelay: 1,
+        displayStableDelay: 5,
         systemEventGracePeriod: 5,
         verificationFallbackDelay: 2,
         displayReconfigurationTimeout: 15

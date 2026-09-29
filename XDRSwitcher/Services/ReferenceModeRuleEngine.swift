@@ -35,16 +35,25 @@ final class ReferenceModeRuleEngine {
     private struct PendingRequest: Equatable {
         let application: ActiveApplicationInfo
         let targetID: String
+        let coldLaunchUptime: TimeInterval?
     }
+
+    private struct LaunchRecord: Equatable {
+        let bundleIdentifier: String
+        let uptime: TimeInterval
+    }
+
+    static let geforceNOWBundleIdentifier: String = "com.nvidia.gfnpc.mall"
 
     private let displayPresetService: any DisplayPresetServicing
     private let ownBundleIdentifier: String?
     private let policy: ReferenceModeSafetyPolicy
     private let uptime: UptimeProvider
+    private let switchDelayRange: ClosedRange<TimeInterval>
 
     private var pendingTask: Task<Void, Never>?
     private var pendingRequest: PendingRequest?
-    private var launchedAtByPID: [pid_t: TimeInterval] = [:]
+    private var launchedApplicationsByPID: [pid_t: LaunchRecord] = [:]
     private var lastExternalApplicationInfo: ActiveApplicationInfo?
     private var lastSwitchUptime: TimeInterval?
     private var lastDisplayChangeUptime: TimeInterval?
@@ -64,11 +73,13 @@ final class ReferenceModeRuleEngine {
         displayPresetService: any DisplayPresetServicing,
         ownBundleIdentifier: String?,
         policy: ReferenceModeSafetyPolicy? = nil,
+        switchDelayRange: ClosedRange<TimeInterval> = 4...4,
         uptime: @escaping UptimeProvider = { ProcessInfo.processInfo.systemUptime }
     ) {
         self.displayPresetService = displayPresetService
         self.ownBundleIdentifier = ownBundleIdentifier
         self.policy = policy ?? .standard
+        self.switchDelayRange = switchDelayRange
         self.uptime = uptime
     }
 
@@ -85,15 +96,19 @@ final class ReferenceModeRuleEngine {
 
     func recordLaunch(_ application: ActiveApplicationInfo, settings: XDRSwitcherSettings) {
         guard let bundleIdentifier = application.bundleIdentifier,
+              bundleIdentifier == Self.geforceNOWBundleIdentifier,
               settings.appRules.contains(where: { $0.enabled && $0.bundleIdentifier == bundleIdentifier }) else {
             return
         }
-        launchedAtByPID[application.processIdentifier] = uptime()
-        log(application, coldLaunch: true, target: nil, message: "launch recorded")
+        launchedApplicationsByPID[application.processIdentifier] = LaunchRecord(
+            bundleIdentifier: bundleIdentifier,
+            uptime: uptime()
+        )
+        print("[XDRSwitcher] Cold launch detected: \(application.displayName), pid=\(application.processIdentifier)")
     }
 
     func recordTermination(_ application: ActiveApplicationInfo) {
-        launchedAtByPID.removeValue(forKey: application.processIdentifier)
+        launchedApplicationsByPID.removeValue(forKey: application.processIdentifier)
         if pendingRequest?.application.processIdentifier == application.processIdentifier {
             cancelPendingSwitch(reason: "scheduled application terminated")
         }
@@ -105,14 +120,13 @@ final class ReferenceModeRuleEngine {
         displayConfigurationBeganUptime = uptime()
         cancelPendingSwitch(reason: "display reconfiguration began")
         onStatusChange(.waitingForDisplayStabilization, Int(ceil(policy.displayReconfigurationTimeout)))
-        print("XDRSwitcher display reconfiguration begin")
+        print("[XDRSwitcher] Display reconfiguration began")
     }
 
     func displayReconfigurationEnded() {
         displayConfigurationBeganUptime = nil
         lastDisplayChangeUptime = uptime()
-        lastSystemEventUptime = uptime()
-        print("XDRSwitcher display reconfiguration end")
+        print("[XDRSwitcher] Display reconfiguration ended; stabilization period started: \(policy.displayStableDelay)s")
     }
 
     func systemDidWake() {
@@ -122,7 +136,7 @@ final class ReferenceModeRuleEngine {
 
     func cancelPendingSwitch(reason: String = "explicit cancellation") {
         if pendingTask != nil {
-            print("XDRSwitcher pending switch cancelled reason=\(reason)")
+            print("[XDRSwitcher] Pending Task cancelled: \(reason)")
         }
         pendingTask?.cancel()
         pendingTask = nil
@@ -251,6 +265,14 @@ final class ReferenceModeRuleEngine {
             return
         }
 
+        guard displayConfigurationBeganUptime == nil else {
+            cancelPendingSwitch(reason: "display reconfiguration in progress")
+            onPendingChange(false)
+            onStatusChange(.waitingForDisplayStabilization, nil)
+            print("[XDRSwitcher] Switch skipped: display reconfiguration in progress")
+            return
+        }
+
         do {
             guard let target = try Self.targetPreset(
                 for: application.bundleIdentifier,
@@ -267,12 +289,18 @@ final class ReferenceModeRuleEngine {
                 return
             }
 
-            let request = PendingRequest(application: application, targetID: target.uniqueID)
-            if request == pendingRequest { return }
+            if pendingRequest?.application == application, pendingRequest?.targetID == target.uniqueID {
+                return
+            }
+            let request = PendingRequest(
+                application: application,
+                targetID: target.uniqueID,
+                coldLaunchUptime: consumeColdLaunchUptime(for: application)
+            )
             cancelPendingSwitch(reason: "new active application event")
             schedule(
                 request: request,
-                debounce: settings.switchDelaySeconds,
+                debounce: min(max(settings.switchDelaySeconds, switchDelayRange.lowerBound), switchDelayRange.upperBound),
                 currentFrontmostApplication: currentFrontmostApplication,
                 currentSettings: currentSettings,
                 currentPresets: currentPresets,
@@ -307,34 +335,31 @@ final class ReferenceModeRuleEngine {
         guard request.application.bundleIdentifier != nil else { return }
 
         let now = uptime()
-        let coldLaunchUptime = launchedAtByPID[request.application.processIdentifier]
+        let coldLaunchUptime = request.coldLaunchUptime
         let delay: TimeInterval
         let status: ReferenceModeAutomationStatus
 
-        if let began = displayConfigurationBeganUptime {
-            let elapsed = now - began
-            if elapsed >= policy.displayReconfigurationTimeout {
-                onError(ReferenceModeRuleEngineError.displayReconfigurationTimedOut.localizedDescription)
-                onStatusChange(.waitingForDisplayStabilization, 0)
-                return
-            }
-            delay = policy.displayReconfigurationTimeout - elapsed
-            status = .waitingForDisplayStabilization
+        let decision = waitingDecision(now: now, launchUptime: coldLaunchUptime, debounce: debounce)
+        if isApplyingPreset {
+            delay = max(decision.delay, policy.verificationFallbackDelay + policy.postSwitchCooldown)
+            status = .coolingDown
         } else {
-            let decision = waitingDecision(now: now, launchUptime: coldLaunchUptime, debounce: debounce)
-            if isApplyingPreset {
-                delay = max(decision.delay, policy.verificationFallbackDelay + policy.postSwitchCooldown)
-                status = .coolingDown
-            } else {
-                delay = decision.delay
-                status = decision.status
-            }
+            delay = decision.delay
+            status = decision.status
         }
 
         pendingRequest = request
         onPendingChange(true)
         onStatusChange(status, Self.countdownSeconds(for: status, delay: delay))
-        log(request.application, coldLaunch: coldLaunchUptime != nil, target: request.targetID, message: "wait=\(delay)s reason=\(status.rawValue)")
+        logWaitingDecision(
+            application: request.application,
+            targetID: request.targetID,
+            now: now,
+            debounce: debounce,
+            launchUptime: coldLaunchUptime,
+            effectiveDelay: delay,
+            status: status
+        )
 
         pendingTask = Task { [weak self] in
             do {
@@ -353,6 +378,7 @@ final class ReferenceModeRuleEngine {
                 return
             }
             guard let self, self.pendingRequest == request else { return }
+            guard !Task.isCancelled else { return }
 
             if self.displayConfigurationBeganUptime != nil {
                 self.pendingTask = nil
@@ -397,7 +423,25 @@ final class ReferenceModeRuleEngine {
                     return
                 }
 
-                guard !self.isApplyingPreset else { return }
+                guard !self.isApplyingPreset else {
+                    self.pendingTask = nil
+                    print("[XDRSwitcher] Switch deferred: another Reference Mode change is running")
+                    self.schedule(
+                        request: request,
+                        debounce: 0,
+                        currentFrontmostApplication: currentFrontmostApplication,
+                        currentSettings: currentSettings,
+                        currentPresets: currentPresets,
+                        currentPresetID: currentPresetID,
+                        onPendingChange: onPendingChange,
+                        onStatusChange: onStatusChange,
+                        onTargetChange: onTargetChange,
+                        onError: onError,
+                        onApplied: onApplied
+                    )
+                    return
+                }
+                guard !Task.isCancelled else { return }
                 self.pendingTask = nil
                 self.pendingRequest = nil
                 self.isApplyingPreset = true
@@ -405,7 +449,9 @@ final class ReferenceModeRuleEngine {
                 onStatusChange(.switching, nil)
                 onTargetChange(latestTarget.name)
                 onError(nil)
-                self.log(request.application, coldLaunch: coldLaunchUptime != nil, target: latestTarget.name, message: "switching")
+                print("[XDRSwitcher] Revalidation succeeded")
+                print("[XDRSwitcher] Applying preset: \(latestTarget.name)")
+                print("[XDRSwitcher] CoreDisplay call: yes")
 
                 do {
                     let snapshot = try await self.displayPresetService.applyPresetForAutomaticSwitch(uniqueID: latestTarget.uniqueID)
@@ -413,21 +459,23 @@ final class ReferenceModeRuleEngine {
                     self.isApplyingPreset = false
                     onApplied(snapshot)
                     onStatusChange(.coolingDown, nil)
-                    print("XDRSwitcher cooldown start duration=\(self.policy.postSwitchCooldown)s")
+                    print("[XDRSwitcher] Cooldown started: \(self.policy.postSwitchCooldown) seconds")
                     Task { @MainActor [weak self] in
                         try? await Task.sleep(for: .seconds(self?.policy.postSwitchCooldown ?? 0))
                         guard let self else { return }
-                        print("XDRSwitcher cooldown end")
+                        print("[XDRSwitcher] Cooldown ended")
                         if self.pendingTask == nil {
                             onStatusChange(.ready, nil)
                         }
                     }
                 } catch is CancellationError {
                     self.isApplyingPreset = false
+                    print("[XDRSwitcher] Switch skipped: task cancelled")
                 } catch {
                     self.isApplyingPreset = false
                     onError(error.localizedDescription)
                     onStatusChange(.ready, nil)
+                    print("[XDRSwitcher] CoreDisplay call failed: \(error.localizedDescription)")
                 }
             } catch {
                 onError(error.localizedDescription)
@@ -463,6 +511,52 @@ final class ReferenceModeRuleEngine {
             consider(policy.systemEventGracePeriod - (now - lastSystemEventUptime), status: .waitingForDisplayStabilization)
         }
         return decision
+    }
+
+    private func consumeColdLaunchUptime(for application: ActiveApplicationInfo) -> TimeInterval? {
+        guard application.bundleIdentifier == Self.geforceNOWBundleIdentifier,
+              let bundleIdentifier = application.bundleIdentifier,
+              let record = launchedApplicationsByPID[application.processIdentifier],
+              record.bundleIdentifier == bundleIdentifier else {
+            return nil
+        }
+        launchedApplicationsByPID.removeValue(forKey: application.processIdentifier)
+        return record.uptime
+    }
+
+    private func logWaitingDecision(
+        application: ActiveApplicationInfo,
+        targetID: String,
+        now: TimeInterval,
+        debounce: TimeInterval,
+        launchUptime: TimeInterval?,
+        effectiveDelay: TimeInterval,
+        status: ReferenceModeAutomationStatus
+    ) {
+        let debounceEnd = now + debounce
+        let bootEnd = policy.bootGracePeriod
+        let coldLaunchEnd = launchUptime.map { $0 + policy.coldLaunchDelay }
+        let wakeEnd = lastSystemEventUptime.map { $0 + policy.systemEventGracePeriod }
+        let displayEnd = lastDisplayChangeUptime.map { $0 + policy.displayStableDelay }
+        let cooldownEnd = lastSwitchUptime.map { $0 + policy.postSwitchCooldown }
+        let bundleIdentifier = application.bundleIdentifier ?? "Not Available"
+        let coldLaunchDeadline = coldLaunchEnd.map { String($0) } ?? "none"
+        let wakeDeadline = wakeEnd.map { String($0) } ?? "none"
+        let displayDeadline = displayEnd.map { String($0) } ?? "none"
+        let cooldownDeadline = cooldownEnd.map { String($0) } ?? "none"
+        print(
+            "[XDRSwitcher] Active app: \(application.displayName), bundleIdentifier=\(bundleIdentifier), " +
+            "pid=\(application.processIdentifier), coldLaunch=\(launchUptime != nil), target=\(targetID)"
+        )
+        if launchUptime != nil {
+            print("[XDRSwitcher] Waiting \(policy.coldLaunchDelay) seconds for GPU initialization")
+        }
+        print(
+            "[XDRSwitcher] Protection deadlines: debounce=\(debounceEnd), boot=\(bootEnd), " +
+            "coldLaunch=\(coldLaunchDeadline), wake=\(wakeDeadline), " +
+            "display=\(displayDeadline), cooldown=\(cooldownDeadline)"
+        )
+        print("[XDRSwitcher] Effective wait reason: \(status), scheduledUptime=\(now + effectiveDelay)")
     }
 
     private static func countdownSeconds(
