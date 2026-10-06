@@ -14,12 +14,8 @@ struct AppState {
     var automaticSwitchingErrorMessage: String?
     var launchAtLoginStatus = LaunchAtLoginStatus.notRegistered
     var launchAtLoginErrorMessage: String?
-    var targetReferenceModeName = "Not Available"
-    var isPendingReferenceModeSwitch = false
     var isRefreshingReferenceModes = false
     var isApplyingReferenceMode = false
-    var automaticSwitchingStatus = ReferenceModeAutomationStatus.paused
-    var automaticSwitchingRemainingSeconds: Int?
 
     private var settingsStore: SettingsStore
     private var launchAtLoginService: any LaunchAtLoginServicing
@@ -214,22 +210,6 @@ struct AppState {
             referenceModeErrorMessage = error.localizedDescription
             print("XDRSwitcher CoreDisplay apply error: \(error.localizedDescription)")
         }
-    }
-
-    mutating func setAutomaticSwitchingPending(_ isPending: Bool) {
-        isPendingReferenceModeSwitch = isPending
-    }
-
-    mutating func setAutomaticSwitchingStatus(
-        _ status: ReferenceModeAutomationStatus,
-        remainingSeconds: Int? = nil
-    ) {
-        automaticSwitchingStatus = status
-        automaticSwitchingRemainingSeconds = remainingSeconds
-    }
-
-    mutating func setTargetReferenceModeName(_ name: String) {
-        targetReferenceModeName = name
     }
 
     mutating func setAutomaticSwitchingErrorMessage(_ message: String?) {

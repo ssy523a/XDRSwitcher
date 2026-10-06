@@ -16,16 +16,13 @@ protocol DisplayPresetServicing {
 struct DisplayPresetService: DisplayPresetServicing {
     private let coreDisplayFactory: () throws -> any CoreDisplayPresetControlling
     private let displayIDProvider: () throws -> CGDirectDisplayID
-    private let verificationDelay: TimeInterval
 
     init(
         coreDisplayFactory: @escaping () throws -> any CoreDisplayPresetControlling = { try CoreDisplaySPI() },
-        displayIDProvider: @escaping () throws -> CGDirectDisplayID = { try Self.builtInDisplayID() },
-        verificationDelay: TimeInterval = ReferenceModeSafetyPolicy.standard.verificationFallbackDelay
+        displayIDProvider: @escaping () throws -> CGDirectDisplayID = { try Self.builtInDisplayID() }
     ) {
         self.coreDisplayFactory = coreDisplayFactory
         self.displayIDProvider = displayIDProvider
-        self.verificationDelay = verificationDelay
     }
 
     func loadBuiltInDisplayPresets() throws -> DisplayPresetSnapshot {
@@ -35,7 +32,7 @@ struct DisplayPresetService: DisplayPresetServicing {
     }
 
     func applyPreset(uniqueID: String) throws -> DisplayPresetSnapshot {
-        try applyPreset(uniqueID: uniqueID, verificationDelay: 0)
+        try applyPresetImmediately(uniqueID: uniqueID)
     }
 
     func applyPresetForAutomaticSwitch(uniqueID: String) async throws -> DisplayPresetSnapshot {
@@ -62,7 +59,6 @@ struct DisplayPresetService: DisplayPresetServicing {
             throw CoreDisplayError.presetSwitchFailed(index: targetPreset.runtimeIndex, status: status)
         }
 
-        try await Task.sleep(for: .seconds(verificationDelay))
         try Task.checkCancellation()
 
         // Query exactly once after the safety delay. A failed verification ends this request.
@@ -80,7 +76,7 @@ struct DisplayPresetService: DisplayPresetServicing {
         return updatedSnapshot
     }
 
-    private func applyPreset(uniqueID: String, verificationDelay: TimeInterval) throws -> DisplayPresetSnapshot {
+    private func applyPresetImmediately(uniqueID: String) throws -> DisplayPresetSnapshot {
         let displayID = try displayIDProvider()
         let coreDisplay = try coreDisplayFactory()
         let currentSnapshot = try loadPresets(for: displayID, using: coreDisplay)
@@ -91,9 +87,6 @@ struct DisplayPresetService: DisplayPresetServicing {
         let status = try coreDisplay.setActivePresetIndex(targetPreset.runtimeIndex, for: displayID)
         guard status >= 0 else {
             throw CoreDisplayError.presetSwitchFailed(index: targetPreset.runtimeIndex, status: status)
-        }
-        if verificationDelay > 0 {
-            Thread.sleep(forTimeInterval: verificationDelay)
         }
         let updatedSnapshot = try loadPresets(for: displayID, using: coreDisplay)
         guard updatedSnapshot.activePreset?.uniqueID == targetPreset.uniqueID else {
