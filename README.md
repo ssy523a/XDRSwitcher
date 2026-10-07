@@ -12,7 +12,7 @@ It is designed for Macs equipped with an XDR display, where different applicatio
 * Uses the application’s Bundle Identifier for reliable rule matching
 * Automatically restores the default Reference Mode for applications without a specific rule
 * Allows automatic switching to be paused or resumed
-* Provides a configurable delay to prevent unnecessary switching during rapid application changes
+* Uses a fixed four-second delay to prevent unnecessary switching during rapid application changes
 * Avoids repeatedly applying a Reference Mode that is already active
 * Stores application rules and preferences locally
 * Supports launching automatically at login
@@ -33,7 +33,9 @@ XDRSwitcher monitors changes to the frontmost macOS application. When an applica
 
 If a matching rule exists, XDRSwitcher applies the assigned Reference Mode. If no matching rule is found, it restores the user-selected default Reference Mode.
 
-A short switching delay is applied after each application change. If another application becomes active before the delay expires, the previous request is cancelled. This helps prevent rapid or unnecessary display mode changes when switching between applications.
+After an application change, XDRSwitcher waits four seconds. If another application becomes active during that time, the previous request is cancelled. When the delay expires, XDRSwitcher changes the Reference Mode only if the same application and process identifier (PID) are still frontmost. This helps prevent rapid or unnecessary display mode changes when switching between applications.
+
+For a newly launched GeForce NOW process, XDRSwitcher also protects the first activation until ten seconds after launch. It uses the later of that deadline and the normal four-second application-switch deadline. Later activations of the same process use only the normal four-second delay.
 
 ## Typical Uses
 

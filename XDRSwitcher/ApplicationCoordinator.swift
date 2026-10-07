@@ -63,8 +63,10 @@ final class ApplicationCoordinator {
         activeApplicationMonitor.start { [weak self] event in
             guard let self else { return }
             switch event {
-            case .launched, .terminated:
-                break
+            case let .launched(application):
+                referenceModeRuleEngine.recordApplicationLaunch(application)
+            case let .terminated(application):
+                referenceModeRuleEngine.recordApplicationTermination(application)
             case let .activated(application):
                 appState.updateActiveApplication(application)
                 evaluateReferenceModeAutomation(for: application)
@@ -75,11 +77,15 @@ final class ApplicationCoordinator {
             onWillTerminate: { [weak self] in
                 self?.referenceModeRuleEngine.cancelPendingSwitch(reason: "application terminating")
             },
-            onWillSleep: {},
+            onWillSleep: { [weak self] in
+                self?.referenceModeRuleEngine.cancelPendingSwitch(reason: "system will sleep")
+            },
             onDidWake: { [weak self] in
                 self?.refreshReferenceModesAndReevaluateAutomation()
             },
-            onDisplayConfigurationWillChange: {},
+            onDisplayConfigurationWillChange: { [weak self] in
+                self?.referenceModeRuleEngine.cancelPendingSwitch(reason: "display configuration changing")
+            },
             onDisplayConfigurationDidChange: { [weak self] in
                 self?.refreshReferenceModesAndReevaluateAutomation()
             }

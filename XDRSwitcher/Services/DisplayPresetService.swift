@@ -61,7 +61,7 @@ struct DisplayPresetService: DisplayPresetServicing {
 
         try Task.checkCancellation()
 
-        // Query exactly once after the safety delay. A failed verification ends this request.
+        // Query exactly once after the change. A failed verification ends this request.
         let updatedSnapshot = try loadPresets(for: displayID, using: coreDisplay)
         guard updatedSnapshot.activePreset?.uniqueID == targetPreset.uniqueID else {
             print("XDRSwitcher post-switch verification failed target=\(targetPreset.displayName)")

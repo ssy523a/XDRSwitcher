@@ -56,8 +56,13 @@ private final class AutomationHarness {
         engine = ReferenceModeRuleEngine(
             displayPresetService: service,
             ownBundleIdentifier: "com.example.XDRSwitcher",
-            switchDelayRange: 0.01...0.01
+            switchDelayRange: 0.01...0.01,
+            coldLaunchProtectionDuration: 0.05
         )
+    }
+
+    func launch(_ application: ActiveApplicationInfo) {
+        engine.recordApplicationLaunch(application)
     }
 
     func activate(_ application: ActiveApplicationInfo) {
@@ -109,6 +114,13 @@ private extension XDRSwitcherSettings {
                 appPath: nil,
                 presetUniqueID: "rule",
                 presetName: "Rule"
+            ),
+            AppRule(
+                appDisplayName: "GeForce NOW",
+                bundleIdentifier: "com.nvidia.gfnpc.mall",
+                appPath: nil,
+                presetUniqueID: "rule",
+                presetName: "Rule"
             )
         ],
         switchDelaySeconds: 4,
@@ -136,6 +148,13 @@ private extension ActiveApplicationInfo {
         bundleIdentifier: "com.example.XDRSwitcher",
         bundleURL: nil,
         processIdentifier: 303
+    )
+
+    static let geforceNow = ActiveApplicationInfo(
+        localizedName: "GeForce NOW",
+        bundleIdentifier: "com.nvidia.gfnpc.mall",
+        bundleURL: nil,
+        processIdentifier: 404
     )
 }
 
@@ -165,13 +184,47 @@ struct ReferenceModeSafetyTests {
         #expect(harness.service.appliedIDs == ["rule"])
     }
 
+    @Test("A newly launched GeForce NOW process uses cold-launch protection")
+    func geforceNowColdLaunch() async {
+        let harness = AutomationHarness()
+        harness.launch(.geforceNow)
+        harness.activate(.geforceNow)
+        await wait(0.02)
+        #expect(harness.service.applyCount == 0)
+        await wait(0.05)
+        #expect(harness.service.appliedIDs == ["rule"])
+
+        harness.currentID = "default"
+        harness.activate(.geforceNow)
+        await wait(0.02)
+        #expect(harness.service.appliedIDs == ["rule", "rule"])
+    }
+
+    @Test("An already running GeForce NOW process uses the normal delay")
+    func geforceNowWarmActivation() async {
+        let harness = AutomationHarness()
+        harness.activate(.geforceNow)
+        await wait()
+        #expect(harness.service.appliedIDs == ["rule"])
+    }
+
     @Test("Changing apps cancels the previous request")
     func rapidSwitchCancellation() async {
         let harness = AutomationHarness()
+        harness.currentID = "unrelated"
         harness.activate(.rule)
         harness.activate(.other)
         await wait()
-        #expect(!harness.service.appliedIDs.contains("rule"))
+        #expect(harness.service.appliedIDs == ["default"])
+    }
+
+    @Test("Explicit cancellation prevents a scheduled switch from running later")
+    func explicitCancellation() async {
+        let harness = AutomationHarness()
+        harness.activate(.rule)
+        harness.engine.cancelPendingSwitch(reason: "test cancellation")
+        await wait()
+        #expect(harness.service.applyCount == 0)
     }
 
     @Test("Changing PID before execution cancels the request")

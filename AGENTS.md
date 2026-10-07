@@ -34,7 +34,10 @@
 - Allow the user to associate arbitrary apps with Reference Modes
 - Use the user-specified Default Reference Mode for apps without rules
 - On first launch, save the current Reference Mode as the Default
-- The default switching delay is 0.7 seconds
+- The automatic switching delay is fixed at 4.0 seconds.
+- Use a 10-second cold-launch protection deadline for a newly launched GeForce NOW process; do not use separate boot-grace, wake-grace, display-change-grace, or cooldown timers.
+- Cancel only the pending switch when sleep or display reconfiguration begins.
+- Reevaluate after wake or display reconfiguration completes, applying the same 4.0-second delay when a switch is needed.
 - Provide a pause control for automatic switching
 - Provide Launch at Login
 - Mac App Store distribution is not a goal

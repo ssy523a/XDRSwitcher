@@ -27,6 +27,12 @@ enum ReferenceModeRuleEngineError: LocalizedError, Equatable {
 
 @MainActor
 final class ReferenceModeRuleEngine {
+    private struct LaunchRecord {
+        let bundleIdentifier: String
+        let processIdentifier: pid_t
+        let detectedAt: TimeInterval
+    }
+
     private struct PendingRequest: Equatable {
         let application: ActiveApplicationInfo
         let targetID: String
@@ -35,10 +41,17 @@ final class ReferenceModeRuleEngine {
     private let displayPresetService: any DisplayPresetServicing
     private let ownBundleIdentifier: String?
     private let switchDelayRange: ClosedRange<TimeInterval>
+    private let coldLaunchProtectionDuration: TimeInterval
+    private let uptime: () -> TimeInterval
+
+    private static let geforceNowBundleIdentifiers: Set<String> = [
+        "com.nvidia.gfnpc.mall"
+    ]
 
     private var pendingTask: Task<Void, Never>?
     private var pendingRequest: PendingRequest?
     private var lastExternalApplicationInfo: ActiveApplicationInfo?
+    private var launchRecords: [pid_t: LaunchRecord] = [:]
     private var isApplyingPreset: Bool = false
     private(set) var isPaused = false
 
@@ -52,11 +65,15 @@ final class ReferenceModeRuleEngine {
     init(
         displayPresetService: any DisplayPresetServicing,
         ownBundleIdentifier: String?,
-        switchDelayRange: ClosedRange<TimeInterval> = 4...4
+        switchDelayRange: ClosedRange<TimeInterval> = 4...4,
+        coldLaunchProtectionDuration: TimeInterval = 10,
+        uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     ) {
         self.displayPresetService = displayPresetService
         self.ownBundleIdentifier = ownBundleIdentifier
         self.switchDelayRange = switchDelayRange
+        self.coldLaunchProtectionDuration = coldLaunchProtectionDuration
+        self.uptime = uptime
     }
 
     deinit {
@@ -79,6 +96,24 @@ final class ReferenceModeRuleEngine {
         pendingRequest = nil
     }
 
+    func recordApplicationLaunch(_ application: ActiveApplicationInfo) {
+        guard let bundleIdentifier = application.bundleIdentifier,
+              Self.geforceNowBundleIdentifiers.contains(bundleIdentifier) else {
+            return
+        }
+
+        launchRecords[application.processIdentifier] = LaunchRecord(
+            bundleIdentifier: bundleIdentifier,
+            processIdentifier: application.processIdentifier,
+            detectedAt: uptime()
+        )
+        print("[XDRSwitcher] Cold launch recorded: \(application.displayName), bundleIdentifier=\(bundleIdentifier), pid=\(application.processIdentifier)")
+    }
+
+    func recordApplicationTermination(_ application: ActiveApplicationInfo) {
+        launchRecords.removeValue(forKey: application.processIdentifier)
+    }
+
     func handleActiveApplicationChange(
         _ application: ActiveApplicationInfo,
         settings: XDRSwitcherSettings,
@@ -96,11 +131,14 @@ final class ReferenceModeRuleEngine {
             lastExternalApplicationInfo = application
         }
 
+        let coldLaunchDeadline = consumeColdLaunchDeadline(for: application)
+
         evaluate(
             application: application,
             settings: settings,
             currentReferencePresetID: currentReferencePresetID,
             availableReferencePresets: availableReferencePresets,
+            coldLaunchDeadline: coldLaunchDeadline,
             currentFrontmostApplication: currentFrontmostApplication,
             currentSettings: currentSettings,
             currentPresets: currentPresets,
@@ -174,6 +212,7 @@ final class ReferenceModeRuleEngine {
         settings: XDRSwitcherSettings,
         currentReferencePresetID: String?,
         availableReferencePresets: [ReferencePreset],
+        coldLaunchDeadline: TimeInterval?,
         currentFrontmostApplication: @escaping @MainActor () -> ActiveApplicationInfo?,
         currentSettings: @escaping @MainActor () -> XDRSwitcherSettings,
         currentPresets: @escaping @MainActor () -> [ReferencePreset],
@@ -207,9 +246,18 @@ final class ReferenceModeRuleEngine {
             }
 
             cancelPendingSwitch(reason: "new active application event")
+            let generalDelay = min(
+                max(settings.switchDelaySeconds, switchDelayRange.lowerBound),
+                switchDelayRange.upperBound
+            )
+            let delay = max(generalDelay, (coldLaunchDeadline ?? uptime()) - uptime())
+            if coldLaunchDeadline != nil {
+                print("[XDRSwitcher] Cold launch detected: \(application.displayName), pid=\(application.processIdentifier)")
+                print("[XDRSwitcher] Effective wait reason: coldLaunch, delay=\(delay) seconds")
+            }
             schedule(
                 request: request,
-                delay: min(max(settings.switchDelaySeconds, switchDelayRange.lowerBound), switchDelayRange.upperBound),
+                delay: delay,
                 currentFrontmostApplication: currentFrontmostApplication,
                 currentSettings: currentSettings,
                 currentPresets: currentPresets,
@@ -221,6 +269,18 @@ final class ReferenceModeRuleEngine {
             cancelPendingSwitch(reason: "target preset validation failed")
             onError(error.localizedDescription)
         }
+    }
+
+    private func consumeColdLaunchDeadline(for application: ActiveApplicationInfo) -> TimeInterval? {
+        guard let bundleIdentifier = application.bundleIdentifier,
+              let record = launchRecords[application.processIdentifier],
+              record.bundleIdentifier == bundleIdentifier,
+              record.processIdentifier == application.processIdentifier else {
+            return nil
+        }
+
+        launchRecords.removeValue(forKey: application.processIdentifier)
+        return record.detectedAt + coldLaunchProtectionDuration
     }
 
     private func schedule(
