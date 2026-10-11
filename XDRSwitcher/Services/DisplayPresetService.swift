@@ -52,9 +52,9 @@ struct DisplayPresetService: DisplayPresetServicing {
             return currentSnapshot
         }
 
-        print("XDRSwitcher CoreDisplay call begin target=\(targetPreset.displayName)")
+        print("[XDRSwitcher] coreDisplayCall=begin target=\(targetPreset.displayName) uniqueID=\(targetPreset.uniqueID)")
         let status = try coreDisplay.setActivePresetIndex(targetPreset.runtimeIndex, for: displayID)
-        print("XDRSwitcher CoreDisplay call end status=\(status)")
+        print("[XDRSwitcher] coreDisplayCall=end target=\(targetPreset.displayName) uniqueID=\(targetPreset.uniqueID) status=\(status)")
         guard status >= 0 else {
             throw CoreDisplayError.presetSwitchFailed(index: targetPreset.runtimeIndex, status: status)
         }

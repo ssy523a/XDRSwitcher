@@ -27,10 +27,15 @@ enum ReferenceModeRuleEngineError: LocalizedError, Equatable {
 
 @MainActor
 final class ReferenceModeRuleEngine {
-    private struct LaunchRecord {
-        let bundleIdentifier: String
-        let processIdentifier: pid_t
-        let detectedAt: TimeInterval
+    private struct ColdLaunchRecord {
+        let deadline: TimeInterval
+        let reason: WaitReason
+    }
+
+    private enum WaitReason: String {
+        case coldLaunch
+        case normal
+        case firstSeenFallback
     }
 
     private struct PendingRequest: Equatable {
@@ -43,6 +48,7 @@ final class ReferenceModeRuleEngine {
     private let switchDelayRange: ClosedRange<TimeInterval>
     private let coldLaunchProtectionDuration: TimeInterval
     private let uptime: () -> TimeInterval
+    private let now: () -> Date
 
     private static let geforceNowBundleIdentifiers: Set<String> = [
         "com.nvidia.gfnpc.mall"
@@ -51,9 +57,16 @@ final class ReferenceModeRuleEngine {
     private var pendingTask: Task<Void, Never>?
     private var pendingRequest: PendingRequest?
     private var lastExternalApplicationInfo: ActiveApplicationInfo?
-    private var launchRecords: [pid_t: LaunchRecord] = [:]
+    private var coldLaunchRecords: [pid_t: ColdLaunchRecord] = [:]
+    private var seenGeForceNowProcessIdentifiers: Set<pid_t> = []
     private var isApplyingPreset: Bool = false
     private(set) var isPaused = false
+
+    var coldLaunchProtectionCountForTesting: Int { coldLaunchRecords.count }
+
+    func coldLaunchDeadlineForTesting(processIdentifier: pid_t) -> TimeInterval? {
+        coldLaunchRecords[processIdentifier]?.deadline
+    }
 
     convenience init() {
         self.init(
@@ -67,13 +80,15 @@ final class ReferenceModeRuleEngine {
         ownBundleIdentifier: String?,
         switchDelayRange: ClosedRange<TimeInterval> = 4...4,
         coldLaunchProtectionDuration: TimeInterval = 10,
-        uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+        uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        now: @escaping () -> Date = Date.init
     ) {
         self.displayPresetService = displayPresetService
         self.ownBundleIdentifier = ownBundleIdentifier
         self.switchDelayRange = switchDelayRange
         self.coldLaunchProtectionDuration = coldLaunchProtectionDuration
         self.uptime = uptime
+        self.now = now
     }
 
     deinit {
@@ -89,7 +104,7 @@ final class ReferenceModeRuleEngine {
 
     func cancelPendingSwitch(reason: String = "explicit cancellation") {
         if pendingTask != nil {
-            print("[XDRSwitcher] Pending Task cancelled: \(reason)")
+            print("[XDRSwitcher] pendingSwitch=cancel reason=\(reason)")
         }
         pendingTask?.cancel()
         pendingTask = nil
@@ -97,21 +112,37 @@ final class ReferenceModeRuleEngine {
     }
 
     func recordApplicationLaunch(_ application: ActiveApplicationInfo) {
+        logEvent("launch", application: application)
         guard let bundleIdentifier = application.bundleIdentifier,
               Self.geforceNowBundleIdentifiers.contains(bundleIdentifier) else {
             return
         }
-
-        launchRecords[application.processIdentifier] = LaunchRecord(
-            bundleIdentifier: bundleIdentifier,
-            processIdentifier: application.processIdentifier,
-            detectedAt: uptime()
+        let currentUptime = uptime()
+        let deadline: TimeInterval
+        if application.launchDate != nil {
+            guard let launchDateDeadline = coldLaunchDeadline(
+                from: application.launchDate,
+                currentUptime: currentUptime
+            ) else {
+                seenGeForceNowProcessIdentifiers.insert(application.processIdentifier)
+                return
+            }
+            deadline = launchDateDeadline
+        } else {
+            deadline = currentUptime + coldLaunchProtectionDuration
+        }
+        preserveLaterDeadline(
+            deadline,
+            reason: .coldLaunch,
+            processIdentifier: application.processIdentifier
         )
-        print("[XDRSwitcher] Cold launch recorded: \(application.displayName), bundleIdentifier=\(bundleIdentifier), pid=\(application.processIdentifier)")
+        seenGeForceNowProcessIdentifiers.insert(application.processIdentifier)
     }
 
     func recordApplicationTermination(_ application: ActiveApplicationInfo) {
-        launchRecords.removeValue(forKey: application.processIdentifier)
+        logEvent("terminate", application: application)
+        coldLaunchRecords.removeValue(forKey: application.processIdentifier)
+        seenGeForceNowProcessIdentifiers.remove(application.processIdentifier)
     }
 
     func handleActiveApplicationChange(
@@ -131,14 +162,15 @@ final class ReferenceModeRuleEngine {
             lastExternalApplicationInfo = application
         }
 
-        let coldLaunchDeadline = consumeColdLaunchDeadline(for: application)
+        logEvent("activate", application: application)
+        let protection = coldLaunchProtection(for: application)
 
         evaluate(
             application: application,
             settings: settings,
             currentReferencePresetID: currentReferencePresetID,
             availableReferencePresets: availableReferencePresets,
-            coldLaunchDeadline: coldLaunchDeadline,
+            coldLaunchRecord: protection,
             currentFrontmostApplication: currentFrontmostApplication,
             currentSettings: currentSettings,
             currentPresets: currentPresets,
@@ -212,7 +244,7 @@ final class ReferenceModeRuleEngine {
         settings: XDRSwitcherSettings,
         currentReferencePresetID: String?,
         availableReferencePresets: [ReferencePreset],
-        coldLaunchDeadline: TimeInterval?,
+        coldLaunchRecord: ColdLaunchRecord?,
         currentFrontmostApplication: @escaping @MainActor () -> ActiveApplicationInfo?,
         currentSettings: @escaping @MainActor () -> XDRSwitcherSettings,
         currentPresets: @escaping @MainActor () -> [ReferencePreset],
@@ -250,11 +282,10 @@ final class ReferenceModeRuleEngine {
                 max(settings.switchDelaySeconds, switchDelayRange.lowerBound),
                 switchDelayRange.upperBound
             )
-            let delay = max(generalDelay, (coldLaunchDeadline ?? uptime()) - uptime())
-            if coldLaunchDeadline != nil {
-                print("[XDRSwitcher] Cold launch detected: \(application.displayName), pid=\(application.processIdentifier)")
-                print("[XDRSwitcher] Effective wait reason: coldLaunch, delay=\(delay) seconds")
-            }
+            let currentUptime = uptime()
+            let delay = max(generalDelay, (coldLaunchRecord?.deadline ?? currentUptime) - currentUptime)
+            let reason = coldLaunchRecord?.reason ?? .normal
+            logDecision(application: application, record: coldLaunchRecord, delay: delay, reason: reason)
             schedule(
                 request: request,
                 delay: delay,
@@ -271,16 +302,77 @@ final class ReferenceModeRuleEngine {
         }
     }
 
-    private func consumeColdLaunchDeadline(for application: ActiveApplicationInfo) -> TimeInterval? {
+    private func coldLaunchProtection(for application: ActiveApplicationInfo) -> ColdLaunchRecord? {
         guard let bundleIdentifier = application.bundleIdentifier,
-              let record = launchRecords[application.processIdentifier],
-              record.bundleIdentifier == bundleIdentifier,
-              record.processIdentifier == application.processIdentifier else {
-            return nil
+              Self.geforceNowBundleIdentifiers.contains(bundleIdentifier) else { return nil }
+
+        let currentUptime = uptime()
+        removeExpiredColdLaunchRecords(at: currentUptime)
+        let processIdentifier = application.processIdentifier
+
+        if let launchDate = application.launchDate {
+            let age = max(0, now().timeIntervalSince(launchDate))
+            seenGeForceNowProcessIdentifiers.insert(processIdentifier)
+            if age < coldLaunchProtectionDuration {
+                let deadline = currentUptime + coldLaunchProtectionDuration - age
+                preserveLaterDeadline(deadline, reason: .coldLaunch, processIdentifier: processIdentifier)
+            }
+        } else if coldLaunchRecords[processIdentifier] == nil,
+                  !seenGeForceNowProcessIdentifiers.contains(processIdentifier) {
+            preserveLaterDeadline(
+                currentUptime + coldLaunchProtectionDuration,
+                reason: .firstSeenFallback,
+                processIdentifier: processIdentifier
+            )
+            seenGeForceNowProcessIdentifiers.insert(processIdentifier)
         }
 
-        launchRecords.removeValue(forKey: application.processIdentifier)
-        return record.detectedAt + coldLaunchProtectionDuration
+        return coldLaunchRecords[processIdentifier]
+    }
+
+    private func coldLaunchDeadline(from launchDate: Date?, currentUptime: TimeInterval) -> TimeInterval? {
+        guard let launchDate else { return nil }
+        let age = max(0, now().timeIntervalSince(launchDate))
+        guard age < coldLaunchProtectionDuration else { return nil }
+        return currentUptime + coldLaunchProtectionDuration - age
+    }
+
+    private func preserveLaterDeadline(
+        _ deadline: TimeInterval,
+        reason: WaitReason,
+        processIdentifier: pid_t
+    ) {
+        if let existing = coldLaunchRecords[processIdentifier], existing.deadline >= deadline { return }
+        coldLaunchRecords[processIdentifier] = ColdLaunchRecord(deadline: deadline, reason: reason)
+    }
+
+    private func removeExpiredColdLaunchRecords(at currentUptime: TimeInterval) {
+        coldLaunchRecords = coldLaunchRecords.filter { $0.value.deadline > currentUptime }
+    }
+
+    private func logEvent(_ event: String, application: ActiveApplicationInfo) {
+        let age = application.launchDate.map { max(0, now().timeIntervalSince($0)) }
+        let ageText = age.map { String(format: "%.3f", $0) } ?? "unavailable"
+        print(
+            "[XDRSwitcher] event=\(event) app=\(application.displayName) " +
+            "bundleIdentifier=\(application.bundleIdentifier ?? "Not Available") " +
+            "pid=\(application.processIdentifier) launchDatePresent=\(application.launchDate != nil) " +
+            "processAge=\(ageText)"
+        )
+    }
+
+    private func logDecision(
+        application: ActiveApplicationInfo,
+        record: ColdLaunchRecord?,
+        delay: TimeInterval,
+        reason: WaitReason
+    ) {
+        print(
+            "[XDRSwitcher] event=activate app=\(application.displayName) " +
+            "bundleIdentifier=\(application.bundleIdentifier ?? "Not Available") " +
+            "pid=\(application.processIdentifier) coldLaunchDeadlinePresent=\(record != nil) " +
+            "selectedDelay=\(String(format: "%.3f", delay)) waitReason=\(reason.rawValue)"
+        )
     }
 
     private func schedule(

@@ -37,6 +37,16 @@ private final class MockDisplayPresetService: DisplayPresetServicing {
     }
 }
 
+private final class TestClock {
+    var date = Date(timeIntervalSinceReferenceDate: 1_000)
+    var uptime: TimeInterval = 1_000
+
+    func advance(by interval: TimeInterval) {
+        date.addTimeInterval(interval)
+        uptime += interval
+    }
+}
+
 @MainActor
 private final class AutomationHarness {
     let service = MockDisplayPresetService()
@@ -47,8 +57,11 @@ private final class AutomationHarness {
     var error: String?
     var appliedCount = 0
     let engine: ReferenceModeRuleEngine
+    let clock: TestClock
 
     init() {
+        let clock = TestClock()
+        self.clock = clock
         settings = .test
         presets = [service.defaultPreset, service.rulePreset]
         currentID = service.defaultPreset.uniqueID
@@ -57,7 +70,9 @@ private final class AutomationHarness {
             displayPresetService: service,
             ownBundleIdentifier: "com.example.XDRSwitcher",
             switchDelayRange: 0.01...0.01,
-            coldLaunchProtectionDuration: 0.05
+            coldLaunchProtectionDuration: 0.05,
+            uptime: { clock.uptime },
+            now: { clock.date }
         )
     }
 
@@ -82,6 +97,10 @@ private final class AutomationHarness {
                 self.appliedCount += 1
             }
         )
+    }
+
+    func terminate(_ application: ActiveApplicationInfo) {
+        engine.recordApplicationTermination(application)
     }
 
     func reevaluate() {
@@ -129,6 +148,20 @@ private extension XDRSwitcherSettings {
 }
 
 private extension ActiveApplicationInfo {
+    static func geforceNow(
+        processIdentifier: pid_t = 404,
+        launchDate: Date? = nil,
+        bundleIdentifier: String? = "com.nvidia.gfnpc.mall"
+    ) -> ActiveApplicationInfo {
+        ActiveApplicationInfo(
+            localizedName: "GeForce NOW",
+            bundleIdentifier: bundleIdentifier,
+            bundleURL: nil,
+            processIdentifier: processIdentifier,
+            launchDate: launchDate
+        )
+    }
+
     static let rule = ActiveApplicationInfo(
         localizedName: "Rule App",
         bundleIdentifier: "com.example.rule",
@@ -194,16 +227,110 @@ struct ReferenceModeSafetyTests {
         await wait(0.05)
         #expect(harness.service.appliedIDs == ["rule"])
 
+        harness.clock.advance(by: 0.06)
         harness.currentID = "default"
         harness.activate(.geforceNow)
         await wait(0.02)
         #expect(harness.service.appliedIDs == ["rule", "rule"])
     }
 
+    @Test("Activation before launch notification keeps ten-second protection")
+    func activationBeforeLaunch() {
+        let harness = AutomationHarness()
+        let application = ActiveApplicationInfo.geforceNow(launchDate: harness.clock.date)
+        harness.activate(application)
+        let activationDeadline = harness.engine.coldLaunchDeadlineForTesting(processIdentifier: 404)
+        harness.clock.advance(by: 0.01)
+        harness.launch(application)
+        #expect(harness.engine.coldLaunchDeadlineForTesting(processIdentifier: 404) == activationDeadline)
+    }
+
+    @Test("Recent launch date protects when launch notification is missing")
+    func missingLaunchNotificationUsesLaunchDate() {
+        let harness = AutomationHarness()
+        harness.activate(.geforceNow(launchDate: harness.clock.date.addingTimeInterval(-0.02)))
+        #expect(harness.engine.coldLaunchDeadlineForTesting(processIdentifier: 404) == harness.clock.uptime + 0.03)
+    }
+
+    @Test("First GeForce NOW PID without launch date fails closed")
+    func firstSeenFallback() {
+        let harness = AutomationHarness()
+        harness.activate(.geforceNow)
+        #expect(harness.engine.coldLaunchDeadlineForTesting(processIdentifier: 404) == harness.clock.uptime + 0.05)
+    }
+
+    @Test("A launch event without bundle ID is recovered by activation")
+    func nilLaunchBundleIdentifier() {
+        let harness = AutomationHarness()
+        harness.launch(.geforceNow(launchDate: harness.clock.date, bundleIdentifier: nil))
+        harness.activate(.geforceNow(launchDate: harness.clock.date))
+        #expect(harness.engine.coldLaunchProtectionCountForTesting == 1)
+    }
+
+    @Test("Cancelled request retains protection for the same PID")
+    func cancellationRetainsProtection() {
+        let harness = AutomationHarness()
+        let application = ActiveApplicationInfo.geforceNow(launchDate: harness.clock.date)
+        harness.activate(application)
+        let deadline = harness.engine.coldLaunchDeadlineForTesting(processIdentifier: 404)
+        harness.activate(.other)
+        harness.clock.advance(by: 0.02)
+        harness.activate(application)
+        #expect(harness.engine.coldLaunchDeadlineForTesting(processIdentifier: 404) == deadline)
+    }
+
+    @Test("An already-active target does not consume PID protection")
+    func activeTargetRetainsProtection() {
+        let harness = AutomationHarness()
+        harness.currentID = "rule"
+        harness.activate(.geforceNow(launchDate: harness.clock.date))
+        #expect(harness.engine.coldLaunchProtectionCountForTesting == 1)
+    }
+
+    @Test("Expired protection uses normal delay and is removed")
+    func expiredProtectionIsRemoved() async {
+        let harness = AutomationHarness()
+        let application = ActiveApplicationInfo.geforceNow(launchDate: harness.clock.date)
+        harness.launch(application)
+        harness.clock.advance(by: 0.06)
+        harness.activate(application)
+        #expect(harness.engine.coldLaunchProtectionCountForTesting == 0)
+        await wait()
+        #expect(harness.service.appliedIDs == ["rule"])
+    }
+
+    @Test("An old process first seen uses the normal delay")
+    func oldProcessFirstSeen() async {
+        let harness = AutomationHarness()
+        harness.activate(.geforceNow(launchDate: harness.clock.date.addingTimeInterval(-1)))
+        #expect(harness.engine.coldLaunchProtectionCountForTesting == 0)
+        await wait()
+        #expect(harness.service.appliedIDs == ["rule"])
+    }
+
+    @Test("Termination removes PID protection")
+    func terminationRemovesProtection() {
+        let harness = AutomationHarness()
+        let application = ActiveApplicationInfo.geforceNow(launchDate: harness.clock.date)
+        harness.activate(application)
+        harness.terminate(application)
+        #expect(harness.engine.coldLaunchProtectionCountForTesting == 0)
+    }
+
+    @Test("Late launch cannot shorten an existing deadline")
+    func lateLaunchDoesNotShortenDeadline() {
+        let harness = AutomationHarness()
+        harness.activate(.geforceNow)
+        let fallbackDeadline = harness.engine.coldLaunchDeadlineForTesting(processIdentifier: 404)
+        harness.clock.advance(by: 0.01)
+        harness.launch(.geforceNow(launchDate: harness.clock.date.addingTimeInterval(-0.04)))
+        #expect(harness.engine.coldLaunchDeadlineForTesting(processIdentifier: 404) == fallbackDeadline)
+    }
+
     @Test("An already running GeForce NOW process uses the normal delay")
     func geforceNowWarmActivation() async {
         let harness = AutomationHarness()
-        harness.activate(.geforceNow)
+        harness.activate(.geforceNow(launchDate: harness.clock.date.addingTimeInterval(-1)))
         await wait()
         #expect(harness.service.appliedIDs == ["rule"])
     }

@@ -6,6 +6,21 @@ struct ActiveApplicationInfo: Equatable {
     let bundleIdentifier: String?
     let bundleURL: URL?
     let processIdentifier: pid_t
+    let launchDate: Date?
+
+    init(
+        localizedName: String,
+        bundleIdentifier: String?,
+        bundleURL: URL?,
+        processIdentifier: pid_t,
+        launchDate: Date? = nil
+    ) {
+        self.localizedName = localizedName
+        self.bundleIdentifier = bundleIdentifier
+        self.bundleURL = bundleURL
+        self.processIdentifier = processIdentifier
+        self.launchDate = launchDate
+    }
 
     var displayName: String {
         localizedName.isEmpty ? (bundleIdentifier ?? "Not Available") : localizedName
@@ -73,7 +88,7 @@ final class ActiveApplicationMonitor {
                 guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
                     return
                 }
-                Task { @MainActor [weak self] in
+                MainActor.assumeIsolated { [weak self] in
                     self?.onEvent?(event(Self.info(from: application)))
                 }
             }
@@ -86,7 +101,8 @@ final class ActiveApplicationMonitor {
             localizedName: application.localizedName ?? "",
             bundleIdentifier: application.bundleIdentifier,
             bundleURL: application.bundleURL,
-            processIdentifier: application.processIdentifier
+            processIdentifier: application.processIdentifier,
+            launchDate: application.launchDate
         )
     }
 }
