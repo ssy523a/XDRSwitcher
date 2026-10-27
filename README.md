@@ -66,6 +66,16 @@ XDRSwitcher is intended for supported Apple displays that provide macOS Referenc
 
 The exact list of available presets depends on the display model and installed macOS version.
 
+**Known Issue and Temporary Development Pause**
+
+XDRSwitcher currently relies on private CoreDisplay APIs because macOS does not provide a public API for changing display Reference Modes programmatically.
+
+During testing on macOS 27.2 beta, changing the Reference Mode around the time GeForce NOW starts has occasionally coincided with a system-level kernel panic involving Apple’s DCP/IOMFB display subsystem (axi_rd_err). The available evidence does not conclusively prove that XDRSwitcher is the direct cause, but automatic Reference Mode switching appears capable of triggering or exposing this macOS display-driver issue.
+
+Because a failure can restart the entire Mac rather than merely close the application, further development and testing are temporarily paused. Automatic switching should not be used in the affected environment.
+
+Development may resume after a future macOS update resolves the issue or a safer, officially supported method for changing Reference Modes becomes available.
+
 ## Disclaimer
 
 This project is not affiliated with, endorsed by, or supported by Apple Inc.
