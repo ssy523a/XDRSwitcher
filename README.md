@@ -66,7 +66,7 @@ XDRSwitcher is intended for supported Apple displays that provide macOS Referenc
 
 The exact list of available presets depends on the display model and installed macOS version.
 
-**Known Issue and Temporary Development Pause**
+## Known Issue and Temporary Development Pause
 
 XDRSwitcher currently relies on private CoreDisplay APIs because macOS does not provide a public API for changing display Reference Modes programmatically.
 
